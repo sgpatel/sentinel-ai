@@ -6,14 +6,24 @@ import io.sentinel.backend.agents.ReplyAgent;
 import io.sentinel.backend.agents.SentimentAgent;
 import io.sentinel.backend.agents.TicketAgent;
 import io.sentinel.backend.connector.TicketConnectorFactory;
+import io.sentinel.backend.repository.MentionDlqEntity;
+import io.sentinel.backend.repository.MentionDlqRepository;
 import io.sentinel.backend.repository.MentionEntity;
 import io.sentinel.backend.repository.MentionRepository;
 import io.sentinel.backend.websocket.MentionWebSocketHandler;
 import io.squados.annotation.AgentRole;
 import io.squados.context.SquadContext;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 
 /**
  * Core 5-step AI processing pipeline for each mention.
@@ -34,15 +44,28 @@ public class MentionProcessingService {
 
     private final SquadContext           ctx;
     private final MentionRepository      repo;
+    private final MentionDlqRepository   dlqRepo;
     private final TicketConnectorFactory connectorFactory;
     private final MentionWebSocketHandler ws;
+    @Value("${sentinel.retry.max-attempts:3}")
+    private int retryMaxAttempts;
+    @Value("${sentinel.retry.base-delay-ms:200}")
+    private long retryBaseDelayMs;
+    @Value("${sentinel.circuit-breaker.failure-threshold:5}")
+    private int circuitFailureThreshold;
+    @Value("${sentinel.circuit-breaker.open-ms:30000}")
+    private long circuitOpenMs;
+    private final Map<String, CircuitState> circuits = new ConcurrentHashMap<>();
+    private final Map<String, OperationStats> opStats = new ConcurrentHashMap<>();
 
     public MentionProcessingService(SquadContext ctx,
                                     MentionRepository repo,
+                                    MentionDlqRepository dlqRepo,
                                     TicketConnectorFactory connectorFactory,
                                     MentionWebSocketHandler ws) {
         this.ctx              = ctx;
         this.repo             = repo;
+        this.dlqRepo          = dlqRepo;
         this.connectorFactory = connectorFactory;
         this.ws               = ws;
     }
@@ -57,6 +80,7 @@ public class MentionProcessingService {
             mention.processingStatus = "ERROR";
             System.err.println("[MentionService] Fatal pipeline error for "
                 + mention.id + ": " + fatal.getMessage());
+            saveToDlq(mention, fatal);
         } finally {
             mention.updatedAt = Instant.now();
             repo.save(mention);
@@ -77,8 +101,9 @@ public class MentionProcessingService {
 
         SentimentAgent.SentimentAnalysis sentiment = null;
         try {
-            sentiment = (SentimentAgent.SentimentAnalysis) ctx.submitTo(
-                AgentRole.ANALYST, sentimentPrompt, SentimentAgent.SentimentAnalysis.class);
+            sentiment = withRetry("SentimentAgent", () ->
+                (SentimentAgent.SentimentAnalysis) ctx.submitTo(
+                    AgentRole.ANALYST, sentimentPrompt, SentimentAgent.SentimentAnalysis.class));
         } catch (Exception e) {
             System.err.println("[MentionService] Sentiment failed for "
                 + mention.id + " (defaults applied): " + e.getMessage());
@@ -111,8 +136,9 @@ public class MentionProcessingService {
 
         EscalationAgent.EscalationDecision escalation = null;
         try {
-            escalation = (EscalationAgent.EscalationDecision) ctx.submitTo(
-                AgentRole.CRITIC, escalationPrompt, EscalationAgent.EscalationDecision.class);
+            escalation = withRetry("EscalationAgent", () ->
+                (EscalationAgent.EscalationDecision) ctx.submitTo(
+                    AgentRole.CRITIC, escalationPrompt, EscalationAgent.EscalationDecision.class));
         } catch (Exception e) {
             System.err.println("[MentionService] Escalation failed for "
                 + mention.id + " (defaults applied): " + e.getMessage());
@@ -140,8 +166,9 @@ public class MentionProcessingService {
 
         ReplyAgent.GeneratedReply reply = null;
         try {
-            reply = (ReplyAgent.GeneratedReply) ctx.submitTo(
-                AgentRole.SUPPORT, replyPrompt, ReplyAgent.GeneratedReply.class);
+            reply = withRetry("ReplyAgent", () ->
+                (ReplyAgent.GeneratedReply) ctx.submitTo(
+                    AgentRole.SUPPORT, replyPrompt, ReplyAgent.GeneratedReply.class));
         } catch (Exception e) {
             System.err.println("[MentionService] Reply generation failed for "
                 + mention.id + ": " + e.getMessage());
@@ -166,8 +193,9 @@ public class MentionProcessingService {
 
         ComplianceAgent.ComplianceReview compliance = null;
         try {
-            compliance = (ComplianceAgent.ComplianceReview) ctx.submitTo(
-                AgentRole.CRITIC, compliancePrompt, ComplianceAgent.ComplianceReview.class);
+            compliance = withRetry("ComplianceAgent", () ->
+                (ComplianceAgent.ComplianceReview) ctx.submitTo(
+                    AgentRole.CRITIC, compliancePrompt, ComplianceAgent.ComplianceReview.class));
         } catch (Exception e) {
             System.err.println("[MentionService] Compliance check non-fatal for "
                 + mention.id + ": " + e.getMessage());
@@ -204,8 +232,9 @@ public class MentionProcessingService {
 
             TicketAgent.TicketPayload ticketPayload = null;
             try {
-                ticketPayload = (TicketAgent.TicketPayload) ctx.submitTo(
-                    AgentRole.SUPPORT, ticketPrompt, TicketAgent.TicketPayload.class);
+                ticketPayload = withRetry("TicketAgent", () ->
+                    (TicketAgent.TicketPayload) ctx.submitTo(
+                        AgentRole.SUPPORT, ticketPrompt, TicketAgent.TicketPayload.class));
             } catch (Exception e) {
                 System.err.println("[MentionService] Ticket agent failed for "
                     + mention.id + ": " + e.getMessage());
@@ -221,7 +250,9 @@ public class MentionProcessingService {
             }
 
             try {
-                String ticketId = connectorFactory.get().createTicket(mention, ticketPayload);
+                final TicketAgent.TicketPayload payloadForCreate = ticketPayload;
+                String ticketId = withRetry("TicketConnector", () ->
+                    connectorFactory.get().createTicket(mention, payloadForCreate));
                 mention.ticketId     = ticketId;
                 mention.ticketStatus = "OPEN";
                 // getName() returns "ZENDESK", "JIRA", or "MOCK"
@@ -259,5 +290,157 @@ public class MentionProcessingService {
     private String truncate(String s, int max) {
         if (s == null) return "";
         return s.length() <= max ? s : s.substring(0, max);
+    }
+
+    @FunctionalInterface
+    private interface RetryableSupplier<T> {
+        T get() throws Exception;
+    }
+
+    private <T> T withRetry(String op, RetryableSupplier<T> action) throws Exception {
+        OperationStats stats = opStats.computeIfAbsent(op, k -> new OperationStats());
+        stats.calls.incrementAndGet();
+        CircuitState state = circuits.computeIfAbsent(op, k -> new CircuitState());
+        long now = System.currentTimeMillis();
+        if (state.isOpen(now)) {
+            stats.failures.incrementAndGet();
+            stats.lastError = "Circuit open";
+            stats.lastFailureAt = Instant.now().toString();
+            throw new RuntimeException("Circuit open for " + op + " until " + state.openUntilEpochMs);
+        }
+
+        int attempts = Math.max(1, retryMaxAttempts);
+        long delay = Math.max(50L, retryBaseDelayMs);
+        Exception last = null;
+        for (int i = 1; i <= attempts; i++) {
+            try {
+                T result = action.get();
+                state.onSuccess();
+                stats.successes.incrementAndGet();
+                return result;
+            } catch (Exception e) {
+                last = e;
+                stats.failures.incrementAndGet();
+                stats.lastError = truncate(nvl(e.getMessage(), e.getClass().getSimpleName()), 300);
+                stats.lastFailureAt = Instant.now().toString();
+                state.onFailure(Math.max(1, circuitFailureThreshold), Math.max(1000L, circuitOpenMs),
+                    System.currentTimeMillis());
+                if (state.isOpen(System.currentTimeMillis())) {
+                    stats.circuitOpens.incrementAndGet();
+                    System.err.println("[MentionService] Circuit opened for " + op
+                        + " after " + state.consecutiveFailures + " consecutive failures");
+                    break;
+                }
+                if (i == attempts) break;
+                stats.retries.incrementAndGet();
+                System.err.println("[MentionService] " + op + " failed attempt "
+                    + i + "/" + attempts + " — retrying in " + delay + "ms: " + e.getMessage());
+                try {
+                    Thread.sleep(delay);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Retry interrupted for " + op, ie);
+                }
+                delay *= 2;
+            }
+        }
+        throw last != null ? last : new RuntimeException("Retry failed for " + op);
+    }
+
+    public Map<String, Object> getReliabilityMetrics() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        Map<String, Object> ops = new LinkedHashMap<>();
+        long now = System.currentTimeMillis();
+        List<String> keys = opStats.keySet().stream().sorted().toList();
+        for (String op : keys) {
+            OperationStats s = opStats.get(op);
+            CircuitState c = circuits.get(op);
+            Map<String, Object> r = new LinkedHashMap<>();
+            r.put("calls", s.calls.get());
+            r.put("successes", s.successes.get());
+            r.put("failures", s.failures.get());
+            r.put("retries", s.retries.get());
+            r.put("circuitOpens", s.circuitOpens.get());
+            r.put("circuitOpen", c != null && c.isOpen(now));
+            r.put("circuitOpenUntil", c != null ? c.openUntilEpochMs : 0L);
+            r.put("lastError", s.lastError);
+            r.put("lastFailureAt", s.lastFailureAt);
+            ops.put(op, r);
+        }
+        out.put("operations", ops);
+        out.put("retryMaxAttempts", retryMaxAttempts);
+        out.put("retryBaseDelayMs", retryBaseDelayMs);
+        out.put("circuitFailureThreshold", circuitFailureThreshold);
+        out.put("circuitOpenMs", circuitOpenMs);
+        return out;
+    }
+
+    private static final class CircuitState {
+        private int consecutiveFailures;
+        private long openUntilEpochMs;
+
+        synchronized boolean isOpen(long nowEpochMs) {
+            return openUntilEpochMs > nowEpochMs;
+        }
+
+        synchronized void onSuccess() {
+            consecutiveFailures = 0;
+            openUntilEpochMs = 0L;
+        }
+
+        synchronized void onFailure(int threshold, long openMs, long nowEpochMs) {
+            if (isOpen(nowEpochMs)) return;
+            consecutiveFailures++;
+            if (consecutiveFailures >= threshold) {
+                openUntilEpochMs = nowEpochMs + openMs;
+            }
+        }
+    }
+
+    private static final class OperationStats {
+        private final AtomicLong calls = new AtomicLong();
+        private final AtomicLong successes = new AtomicLong();
+        private final AtomicLong failures = new AtomicLong();
+        private final AtomicLong retries = new AtomicLong();
+        private final AtomicLong circuitOpens = new AtomicLong();
+        private volatile String lastError = "";
+        private volatile String lastFailureAt = "";
+    }
+
+    private void saveToDlq(MentionEntity mention, Exception fatal) {
+        try {
+            MentionDlqEntity row = new MentionDlqEntity();
+            row.mentionId = mention.id;
+            row.tenantId = nvl(mention.tenantId, "default");
+            row.failureStage = "PIPELINE";
+            row.errorMessage = truncate(nvl(fatal.getMessage(), fatal.getClass().getSimpleName()), 2000);
+            row.stackTrace = stackTraceOf(fatal);
+            row.payloadJson = payloadSnapshot(mention);
+            row.status = "NEW";
+            dlqRepo.save(row);
+        } catch (Exception dlqErr) {
+            System.err.println("[MentionService] DLQ save failed for " + mention.id + ": " + dlqErr.getMessage());
+        }
+    }
+
+    private String stackTraceOf(Throwable t) {
+        StringWriter sw = new StringWriter();
+        t.printStackTrace(new PrintWriter(sw));
+        return sw.toString();
+    }
+
+    private String payloadSnapshot(MentionEntity m) {
+        return "{"
+            + "\"id\":\"" + jsonEsc(nvl(m.id)) + "\","
+            + "\"tenantId\":\"" + jsonEsc(nvl(m.tenantId, "default")) + "\","
+            + "\"platform\":\"" + jsonEsc(nvl(m.platform)) + "\","
+            + "\"authorUsername\":\"" + jsonEsc(nvl(m.authorUsername)) + "\","
+            + "\"handle\":\"" + jsonEsc(nvl(m.handle)) + "\","
+            + "\"text\":\"" + jsonEsc(nvl(m.text)) + "\""
+            + "}";
+    }
+
+    private String jsonEsc(String s) {
+        return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n");
     }
 }

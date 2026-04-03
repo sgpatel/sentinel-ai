@@ -12,17 +12,17 @@ public class AnalyticsService {
     private final MentionRepository repo;
     public AnalyticsService(MentionRepository repo) { this.repo = repo; }
 
-    public Map<String,Object> getSummary(int hours) {
+    public Map<String,Object> getSummary(String tenantId, int hours) {
         Instant since = Instant.now().minus(hours, ChronoUnit.HOURS);
-        List<MentionEntity> all = repo.findByPostedAtAfterOrderByPostedAtDesc(since);
+        List<MentionEntity> all = repo.findByTenantIdAndPostedAtAfterOrderByPostedAtDesc(tenantId, since);
         long total    = all.size();
         long positive = count(all, "POSITIVE");
         long negative = count(all, "NEGATIVE");
         long neutral  = count(all, "NEUTRAL");
         long critical = all.stream().filter(m -> "P1".equals(m.priority)).count();
         long pending  = all.stream().filter(m -> "PENDING".equals(m.replyStatus)).count();
-        long openTkts = repo.findAll().stream().filter(m -> "OPEN".equals(m.ticketStatus)).count();
-        long resvTkts = repo.findAll().stream().filter(m -> "RESOLVED".equals(m.ticketStatus)).count();
+        long openTkts = all.stream().filter(m -> "OPEN".equals(m.ticketStatus)).count();
+        long resvTkts = all.stream().filter(m -> "RESOLVED".equals(m.ticketStatus)).count();
         double health = total == 0 ? 75.0 :
             Math.max(0, Math.min(100,
                 50 + (positive - negative * 2.0) / Math.max(total, 1) * 50));
@@ -41,12 +41,13 @@ public class AnalyticsService {
         return r;
     }
 
-    public List<Map<String,Object>> getSentimentTrend(int hours) {
+    public List<Map<String,Object>> getSentimentTrend(String tenantId, int hours) {
+        List<MentionEntity> tenantMentions = repo.findAllByTenantId(tenantId);
         List<Map<String,Object>> trend = new ArrayList<>();
         for (int h = hours; h >= 0; h -= 2) {
             Instant from = Instant.now().minus(h, ChronoUnit.HOURS);
             Instant to   = Instant.now().minus(Math.max(0,h-2), ChronoUnit.HOURS);
-            List<MentionEntity> bucket = repo.findAll().stream()
+            List<MentionEntity> bucket = tenantMentions.stream()
                 .filter(m -> m.postedAt != null && m.postedAt.isAfter(from) && m.postedAt.isBefore(to))
                 .toList();
             Map<String,Object> pt = new LinkedHashMap<>();
@@ -60,19 +61,19 @@ public class AnalyticsService {
         return trend;
     }
 
-    public Map<String,Long> getCategoryBreakdown(int hours) {
+    public Map<String,Long> getCategoryBreakdown(String tenantId, int hours) {
         Instant since = Instant.now().minus(hours, ChronoUnit.HOURS);
-        return repo.findByPostedAtAfterOrderByPostedAtDesc(since).stream()
+        return repo.findByTenantIdAndPostedAtAfterOrderByPostedAtDesc(tenantId, since).stream()
             .filter(m -> m.topic != null)
             .collect(Collectors.groupingBy(m -> m.topic, Collectors.counting()));
     }
 
-    public Map<String,Object> getBrandHealth() {
+    public Map<String,Object> getBrandHealth(String tenantId) {
         Map<String,Object> r = new LinkedHashMap<>();
-        r.put("score",  getSummary(24).get("brandHealthScore"));
-        r.put("trend",  getSummary(1) .get("brandHealthScore"));
-        r.put("last24h",getSummary(24));
-        r.put("last1h", getSummary(1));
+        r.put("score",  getSummary(tenantId, 24).get("brandHealthScore"));
+        r.put("trend",  getSummary(tenantId, 1) .get("brandHealthScore"));
+        r.put("last24h",getSummary(tenantId, 24));
+        r.put("last1h", getSummary(tenantId, 1));
         return r;
     }
 

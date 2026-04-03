@@ -13,7 +13,9 @@ import { useKeyboard } from "./hooks/useKeyboard";
 import { useInfiniteScroll } from "./hooks/useInfiniteScroll";
 import { useMentions, useLiveEvents, useAnalytics, useTrend,
   useTickets, usePendingReplies, useAlerts,
-  approveReply, rejectReply, resolveTicket, ingestMention, useConfig } from "./hooks/useSentinel";
+  approveReply, rejectReply, resolveTicket, ingestMention, useConfig, useTenants,
+  useSavedSearches, createSavedSearch, deleteSavedSearch, searchMentions,
+  useReliabilityMetrics } from "./hooks/useSentinel";
 import { timeAgo, fmtFollowers } from "./utils/timeAgo";
 import type { Mention } from "./types";
 
@@ -254,7 +256,7 @@ function Sidebar({ tab, setTab, collapsed, setCollapsed, pendingCount, alertCoun
 }
 
 export default function App() {
-  const { user, logout } = useAuth();
+  const { user, logout, isAdmin, activeTenantId, setActiveTenantId } = useAuth();
   if (!user) return <LoginPage/>;
 
   const { isDark } = useTheme();
@@ -268,6 +270,12 @@ export default function App() {
   const [testFoll, setTestFoll]     = useState("500");
   const [testPlatform, setTestPlatform] = useState("TWITTER");
   const [submitting, setSubmitting] = useState(false);
+  const [advQuery, setAdvQuery] = useState({
+    q: "", sentiment: "", priority: "", urgency: "", topic: "", minFollowers: ""
+  });
+  const [searchResults, setSearchResults] = useState<Mention[] | null>(null);
+  const [searchBusy, setSearchBusy] = useState(false);
+  const [savedName, setSavedName] = useState("");
   const { toasts, add: addToast, remove: removeToast } = useToast();
 
   const { data: analytics }   = useAnalytics(24);
@@ -278,6 +286,9 @@ export default function App() {
   const { data: pending, refetch: refetchPending }  = usePendingReplies();
   const alerts                = useAlerts();
   const { data: config } = useConfig();
+  const { data: tenants } = useTenants(isAdmin);
+  const { data: savedSearches, refetch: refetchSavedSearches } = useSavedSearches();
+  const { data: reliability } = useReliabilityMetrics(isAdmin);
 
   // Merge live + historical
   const prevIds = useRef<Set<string>>(new Set());
@@ -302,7 +313,8 @@ export default function App() {
     ...allMentions.filter(m=>!liveMap.has(m.id)||liveMap.get(m.id)!.processingStatus!=="NEW"),
   ].filter((m,i,a)=>a.findIndex(x=>x.id===m.id)===i);
 
-  const filteredMentions = merged.filter(m=>{
+  const sourceMentions = searchResults ?? merged;
+  const filteredMentions = sourceMentions.filter(m=>{
     const ms=!search||(m.text||"").toLowerCase().includes(search.toLowerCase())||
       (m.authorUsername||"").toLowerCase().includes(search.toLowerCase());
     const mf=filter==="ALL"||
@@ -351,6 +363,98 @@ export default function App() {
 
   const onDone = useCallback(()=>{ refetchPending(); refetchMentions(); }, []);
 
+  const runAdvancedSearch = useCallback(async (queryOverride?: typeof advQuery) => {
+    const qv = queryOverride || advQuery;
+    const hasAny = Object.values(qv).some(v => String(v).trim() !== "");
+    if (!hasAny) {
+      setSearchResults(null);
+      return;
+    }
+    setSearchBusy(true);
+    try {
+      const payload: any = {
+        q: qv.q || undefined,
+        sentiment: qv.sentiment || undefined,
+        priority: qv.priority || undefined,
+        urgency: qv.urgency || undefined,
+        topic: qv.topic || undefined,
+        minFollowers: qv.minFollowers ? Number(qv.minFollowers) : undefined,
+        size: 200,
+      };
+      const r = await searchMentions(payload);
+      setSearchResults((r?.content || []) as Mention[]);
+    } catch (e) {
+      console.error(e);
+      addToast({ type:"error", title:"Search failed", message:"Unable to run advanced search" });
+    } finally {
+      setSearchBusy(false);
+    }
+  }, [advQuery, addToast]);
+
+  const clearAdvancedSearch = useCallback(() => {
+    setAdvQuery({ q: "", sentiment: "", priority: "", urgency: "", topic: "", minFollowers: "" });
+    setSearchResults(null);
+  }, []);
+
+  const saveCurrentSearch = useCallback(async () => {
+    const hasAny = Object.values(advQuery).some(v => String(v).trim() !== "");
+    if (!hasAny) {
+      addToast({ type:"warning", title:"Nothing to save", message:"Set at least one query filter first" });
+      return;
+    }
+    if (!savedName.trim()) {
+      addToast({ type:"warning", title:"Name required", message:"Enter a saved search name" });
+      return;
+    }
+    try {
+      const res = await createSavedSearch(savedName.trim(), JSON.stringify(advQuery));
+      if (!res.ok) throw new Error("Failed to save");
+      setSavedName("");
+      refetchSavedSearches();
+      addToast({ type:"success", title:"Saved", message:"Search saved successfully" });
+    } catch {
+      addToast({ type:"error", title:"Save failed", message:"Unable to save search" });
+    }
+  }, [advQuery, savedName, refetchSavedSearches, addToast]);
+
+  const applySavedSearch = useCallback(async (id: string) => {
+    const selected = savedSearches.find(s => s.id === id);
+    if (!selected) return;
+    try {
+      const parsed = JSON.parse(selected.queryJson || "{}");
+      const next = {
+        q: parsed.q || "",
+        sentiment: parsed.sentiment || "",
+        priority: parsed.priority || "",
+        urgency: parsed.urgency || "",
+        topic: parsed.topic || "",
+        minFollowers: parsed.minFollowers ? String(parsed.minFollowers) : "",
+      };
+      setAdvQuery(next);
+      await runAdvancedSearch(next);
+      addToast({ type:"info", title:"Applied", message:`${selected.name} applied` });
+    } catch {
+      addToast({ type:"error", title:"Invalid saved search", message:"Could not parse saved query" });
+    }
+  }, [savedSearches, runAdvancedSearch, addToast]);
+
+  const removeSavedSearch = useCallback(async (id: string) => {
+    try {
+      const res = await deleteSavedSearch(id);
+      if (!res.ok) throw new Error("Delete failed");
+      refetchSavedSearches();
+      addToast({ type:"success", title:"Deleted", message:"Saved search removed" });
+    } catch {
+      addToast({ type:"error", title:"Delete failed", message:"Could not delete saved search" });
+    }
+  }, [refetchSavedSearches, addToast]);
+
+  useEffect(() => {
+    refetchMentions();
+    refetchTickets();
+    refetchPending();
+  }, [activeTenantId, refetchMentions, refetchPending, refetchTickets]);
+
   return <div className="app-layout">
     <Sidebar tab={tab} setTab={setTab} collapsed={collapsed} setCollapsed={setCollapsed}
       pendingCount={pending.length} alertCount={alerts.length}/>
@@ -366,6 +470,16 @@ export default function App() {
         <div style={{display:"flex",alignItems:"center",gap:8}}>
           <Dot/><span style={{color:C.green,fontSize:11}}>LIVE</span>
           <span style={{color:"var(--dim)",fontSize:11}}>{merged.length} mention{merged.length!==1?"s":""}</span>
+          {isAdmin&&tenants.length>0&&<select
+            value={activeTenantId}
+            onChange={(e)=>setActiveTenantId(e.target.value)}
+            style={{
+              background:"var(--bg2)", color:"var(--text)", border:"1px solid var(--border)",
+              borderRadius:7, padding:"4px 8px", fontSize:11, minWidth:130
+            }}
+            title="Active tenant">
+            {tenants.map(t=><option key={t.id} value={t.id}>{t.name} ({t.slug})</option>)}
+          </select>}
           <div style={{width:1,height:16,background:"var(--border)",margin:"0 2px"}}/>
           <KeyboardHelp/>
           <div style={{display:"flex",alignItems:"center",gap:6,background:"var(--bg2)",
@@ -484,6 +598,43 @@ export default function App() {
             <span style={{background:C.blue+"1a",color:C.blue,border:"1px solid "+C.blue+"33",
               borderRadius:20,padding:"2px 9px",fontSize:9,fontWeight:700}}>{filteredMentions.length}</span>
           </div>
+          <div style={{padding:"10px 14px",borderBottom:"1px solid var(--border)",display:"grid",gap:8}}>
+            <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr",gap:8}}>
+              <input value={advQuery.q} onChange={e=>setAdvQuery(v=>({...v,q:e.target.value}))}
+                placeholder="Query text / author / topic"
+                style={{background:"var(--bg)",border:"1px solid var(--border)",color:"var(--text)",padding:"6px 10px",borderRadius:7,fontSize:12}}/>
+              <select value={advQuery.sentiment} onChange={e=>setAdvQuery(v=>({...v,sentiment:e.target.value}))}
+                style={{background:"var(--bg)",border:"1px solid var(--border)",color:"var(--text)",padding:"6px 10px",borderRadius:7,fontSize:12}}>
+                <option value="">Any sentiment</option><option>POSITIVE</option><option>NEGATIVE</option><option>NEUTRAL</option>
+              </select>
+              <select value={advQuery.priority} onChange={e=>setAdvQuery(v=>({...v,priority:e.target.value}))}
+                style={{background:"var(--bg)",border:"1px solid var(--border)",color:"var(--text)",padding:"6px 10px",borderRadius:7,fontSize:12}}>
+                <option value="">Any priority</option><option>P1</option><option>P2</option><option>P3</option><option>P4</option>
+              </select>
+              <input value={advQuery.minFollowers} onChange={e=>setAdvQuery(v=>({...v,minFollowers:e.target.value}))}
+                placeholder="Min followers"
+                style={{background:"var(--bg)",border:"1px solid var(--border)",color:"var(--text)",padding:"6px 10px",borderRadius:7,fontSize:12}}/>
+            </div>
+            <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap" as const}}>
+              <button onClick={()=>runAdvancedSearch()} style={{background:C.blue+"22",color:C.blue,border:"1px solid "+C.blue+"44",borderRadius:6,padding:"5px 10px",cursor:"pointer",fontSize:11,fontFamily:"Inter"}}>
+                {searchBusy?"Searching...":"Run search"}
+              </button>
+              <button onClick={clearAdvancedSearch} style={{background:"none",color:"var(--muted)",border:"1px solid var(--border)",borderRadius:6,padding:"5px 10px",cursor:"pointer",fontSize:11,fontFamily:"Inter"}}>
+                Clear
+              </button>
+              <input value={savedName} onChange={e=>setSavedName(e.target.value)} placeholder="Saved search name"
+                style={{background:"var(--bg)",border:"1px solid var(--border)",color:"var(--text)",padding:"6px 10px",borderRadius:7,fontSize:11,minWidth:180}}/>
+              <button onClick={saveCurrentSearch} style={{background:C.green+"22",color:C.green,border:"1px solid "+C.green+"44",borderRadius:6,padding:"5px 10px",cursor:"pointer",fontSize:11,fontFamily:"Inter"}}>
+                Save current
+              </button>
+            </div>
+            {savedSearches.length>0&&<div style={{display:"flex",gap:6,flexWrap:"wrap" as const}}>
+              {savedSearches.slice(0,8).map(s=><div key={s.id} style={{display:"flex",alignItems:"center",gap:4,background:"var(--bg)",border:"1px solid var(--border)",borderRadius:14,padding:"3px 6px"}}>
+                <button onClick={()=>applySavedSearch(s.id)} style={{background:"none",border:"none",color:"var(--text2)",cursor:"pointer",fontSize:10,fontFamily:"Inter"}}>{s.name}</button>
+                <button onClick={()=>removeSavedSearch(s.id)} style={{background:"none",border:"none",color:C.red,cursor:"pointer",fontSize:10}}>x</button>
+              </div>)}
+            </div>}
+          </div>
           <FilterBar search={search} onSearch={setSearch} filter={filter} onFilter={setFilter}/>
           <div style={{maxHeight:"calc(100vh - 340px)",overflowY:"auto",padding:12}}>
             {mentionsLoading?[0,1,2,3].map(i=><MentionSkeleton key={i}/>):
@@ -496,7 +647,7 @@ export default function App() {
         </div>}
 
         {tab==="analytics"&&<div>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:12}}>
+          <div style={{display:"grid",gridTemplateColumns:isAdmin?"repeat(4,1fr)":"repeat(3,1fr)",gap:12,marginBottom:12}}>
             {[{l:"Total Mentions",v:analytics?.totalMentions??0,c:C.blue,i:"📡"},
               {l:"Brand Health",v:health>0?health.toFixed(1)+"%":"—",c:C.teal,i:"💚"},
               {l:"Critical Alerts",v:analytics?.criticalAlerts??0,c:C.red,i:"🚨"}]
@@ -508,6 +659,23 @@ export default function App() {
                   <span style={{fontSize:24,opacity:.3}}>{s.i}</span>
                 </div>
               </div>)}
+            {isAdmin&&<div style={{background:"var(--card-bg)",border:"1px solid var(--border)",borderRadius:10,padding:"14px 18px"}}>
+              <div style={{display:"flex",justifyContent:"space-between"}}>
+                <div>
+                  <div style={{fontSize:28,fontWeight:700,color:C.purple,fontFamily:"JetBrains Mono",marginBottom:3}}>
+                    {(reliability?.dlq?.new ?? 0) + (reliability?.dlq?.failed ?? 0)}
+                  </div>
+                  <div style={{color:"var(--muted)",fontSize:9,textTransform:"uppercase" as const,letterSpacing:"1.2px",fontWeight:600}}>
+                    Reliability (DLQ Open)
+                  </div>
+                  <div style={{marginTop:6,color:"var(--dim)",fontSize:10}}>
+                    Retries: {(Object.values((reliability?.pipeline?.operations || {}) as Record<string, any>) as any[])
+                      .reduce((sum:number, op:any) => sum + (op?.retries || 0), 0)}
+                  </div>
+                </div>
+                <span style={{fontSize:24,opacity:.3}}>🛠️</span>
+              </div>
+            </div>}
           </div>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
             <div style={{background:"var(--card-bg)",border:"1px solid var(--border)",borderRadius:10,overflow:"hidden"}}>

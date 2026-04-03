@@ -176,6 +176,135 @@ export function useConfig() {
   return { data, loading, refetch: fetch_ };
 }
 
+export function useTenants(enabled = true) {
+  const [data, setData] = useState<Array<{id: string; name: string; slug: string; status: string; plan: string}>>([]);
+  const [loading, setLoading] = useState(enabled);
+  const fetch_ = useCallback(async () => {
+    if (!enabled) {
+      setData([]);
+      setLoading(false);
+      return;
+    }
+    try {
+      const r = await authFetch(`${API}/api/admin/tenants`);
+      if (r.ok) {
+        setData(await r.json());
+      } else {
+        setData([]);
+      }
+    } catch (e) {
+      console.error(e);
+      setData([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [enabled]);
+  useEffect(() => {
+    fetch_();
+  }, [fetch_]);
+  return { data, loading, refetch: fetch_ };
+}
+
+export type MentionSearchQuery = {
+  q?: string;
+  sentiment?: string;
+  priority?: string;
+  urgency?: string;
+  topic?: string;
+  minFollowers?: number;
+  maxFollowers?: number;
+  fromEpochMs?: number;
+  toEpochMs?: number;
+  page?: number;
+  size?: number;
+  sortBy?: string;
+  direction?: "asc" | "desc";
+};
+
+export async function searchMentions(query: MentionSearchQuery) {
+  const p = new URLSearchParams();
+  Object.entries(query).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && String(v) !== "") p.set(k, String(v));
+  });
+  const r = await authFetch(`${API}/api/mentions/search?${p.toString()}`);
+  return r.json();
+}
+
+export type SavedSearch = {
+  id: string;
+  name: string;
+  queryJson: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export function useSavedSearches() {
+  const [data, setData] = useState<SavedSearch[]>([]);
+  const [loading, setLoading] = useState(true);
+  const fetch_ = useCallback(async () => {
+    try {
+      const r = await authFetch(`${API}/api/saved-searches`);
+      if (r.ok) setData(await r.json());
+    } catch (e) {
+      console.error(e);
+      setData([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+  useEffect(() => { fetch_(); }, [fetch_]);
+  return { data, loading, refetch: fetch_ };
+}
+
+export function useReliabilityMetrics(enabled = false) {
+  const [data, setData] = useState<any>(null);
+  const [loading, setLoading] = useState(enabled);
+  const fetch_ = useCallback(async () => {
+    if (!enabled) {
+      setData(null);
+      setLoading(false);
+      return;
+    }
+    try {
+      const r = await authFetch(`${API}/api/admin/reliability/metrics`);
+      if (r.ok) setData(await r.json());
+      else setData(null);
+    } catch (e) {
+      console.error(e);
+      setData(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [enabled]);
+  useEffect(() => {
+    fetch_();
+    if (!enabled) return;
+    const t = setInterval(fetch_, 15000);
+    return () => clearInterval(t);
+  }, [enabled, fetch_]);
+  return { data, loading, refetch: fetch_ };
+}
+
+export async function createSavedSearch(name: string, queryJson: string) {
+  return authFetch(`${API}/api/saved-searches`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, queryJson }),
+  });
+}
+
+export async function updateSavedSearch(id: string, payload: {name?: string; queryJson?: string}) {
+  return authFetch(`${API}/api/saved-searches/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteSavedSearch(id: string) {
+  return authFetch(`${API}/api/saved-searches/${id}`, { method: "DELETE" });
+}
+
 // ── Action helpers ────────────────────────────────────────────────
 export async function approveReply(id: string) {
   return authFetch(`${API}/api/mentions/${id}/reply/approve`, { method: "POST" });

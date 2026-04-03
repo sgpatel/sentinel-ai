@@ -1,0 +1,18 @@
+Issue Type,Summary,Epic Link,Sprint,Order,Depends On,Priority,Story Points,Labels
+Story,Add TenantContext and request interceptor,Phase 1: Multi-Tenant Foundation,Sprint 1 (W1-W2),1,,Highest,3,"phase1,multitenant,backend"
+Story,Create tenant Flyway migration and default tenant seed,Phase 1: Multi-Tenant Foundation,Sprint 1 (W1-W2),2,,Highest,5,"phase1,multitenant,db"
+Story,Make mention/ticket/analytics repositories tenant-scoped,Phase 1: Multi-Tenant Foundation,Sprint 1 (W1-W2),3,"Add TenantContext and request interceptor; Create tenant Flyway migration and default tenant seed",Highest,5,"phase1,multitenant,backend"
+Story,Add tenant admin configuration API,Phase 1: Multi-Tenant Foundation,Sprint 1 (W1-W2),4,"Make mention/ticket/analytics repositories tenant-scoped",High,3,"phase1,multitenant,api"
+Story,Add tenant isolation integration tests,Phase 1: Multi-Tenant Foundation,Sprint 1 (W1-W2),5,"Make mention/ticket/analytics repositories tenant-scoped",Highest,5,"phase1,multitenant,test"
+Story,Add frontend tenant switcher,Phase 1: Multi-Tenant Foundation,Sprint 1 (W1-W2),6,"Add tenant admin configuration API",High,3,"phase1,multitenant,frontend"
+Story,Add DB indexes for search performance,Phase 1: Advanced Filtering & Saved Searches,Sprint 1 (W1-W2),7,"Create tenant Flyway migration and default tenant seed",Medium,3,"phase1,filtering,db"
+Story,Implement GET /api/mentions/search endpoint,Phase 1: Advanced Filtering & Saved Searches,Sprint 2 (W3-W4),1,"Make mention/ticket/analytics repositories tenant-scoped",High,5,"phase1,filtering,backend"
+Story,Add saved search APIs,Phase 1: Advanced Filtering & Saved Searches,Sprint 2 (W3-W4),2,"Implement GET /api/mentions/search endpoint",High,3,"phase1,filtering,api"
+Story,Build frontend query builder v1,Phase 1: Advanced Filtering & Saved Searches,Sprint 2 (W3-W4),3,"Implement GET /api/mentions/search endpoint; Add saved search APIs",High,5,"phase1,filtering,frontend"
+Story,Add retry + exponential backoff for external calls,Phase 1: Error Recovery & Resilience,Sprint 2 (W3-W4),4,"Make mention/ticket/analytics repositories tenant-scoped",High,5,"phase1,resilience,backend"
+Story,Add circuit breaker for external dependencies,Phase 1: Error Recovery & Resilience,Sprint 2 (W3-W4),5,"Add retry + exponential backoff for external calls",High,3,"phase1,resilience,backend"
+Story,Implement DLQ persistence for failed mentions,Phase 1: Error Recovery & Resilience,Sprint 2 (W3-W4),6,"Add retry + exponential backoff for external calls",High,5,"phase1,resilience,db,backend"
+Story,Implement DLQ replay endpoint/job,Phase 1: Error Recovery & Resilience,Sprint 2 (W3-W4),7,"Implement DLQ persistence for failed mentions",Medium,3,"phase1,resilience,api,ops"
+Story,Add reliability metrics and dashboards,Phase 1: Error Recovery & Resilience,Sprint 2 (W3-W4),8,"Add retry + exponential backoff for external calls; Add circuit breaker for external dependencies; Implement DLQ persistence for failed mentions",Medium,3,"phase1,resilience,observability"
+Story,Staging hardening and release gate,Phase 1: Error Recovery & Resilience,Sprint 2 (W3-W4),9,"Implement GET /api/mentions/search endpoint; Build frontend query builder v1; Add retry + exponential backoff for external calls; Add circuit breaker for external dependencies; Implement DLQ persistence for failed mentions; Implement DLQ replay endpoint/job; Add reliability metrics and dashboards",High,3,"phase1,resilience,release"
+

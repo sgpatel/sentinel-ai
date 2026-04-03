@@ -1,4 +1,5 @@
 package io.sentinel.backend.ingestion;
+import io.sentinel.backend.config.TenantContext;
 import io.sentinel.backend.repository.MentionEntity;
 import io.sentinel.backend.service.MentionProcessingService;
 import org.springframework.beans.factory.annotation.Value;
@@ -61,6 +62,7 @@ public class MockMentionIngestionService {
     public void ingestCustomMention(String text, String author, long followers, String platform) {
         MentionEntity m = new MentionEntity();
         m.id = "CUSTOM-" + UUID.randomUUID().toString().substring(0,8);
+        m.tenantId = TenantContext.getOrDefault();
         m.platform = platform; m.handle = handle;
         m.authorUsername = author; m.authorName = author;
         m.authorFollowers = followers;

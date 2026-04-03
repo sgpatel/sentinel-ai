@@ -1,4 +1,5 @@
 package io.sentinel.backend.security;
+import io.sentinel.backend.config.TenantContext;
 import jakarta.servlet.*;
 import jakarta.servlet.http.*;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
@@ -18,20 +19,33 @@ public class JwtAuthFilter extends OncePerRequestFilter {
     @Override
     protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res,
         FilterChain chain) throws ServletException, IOException {
-        String header = req.getHeader("Authorization");
-        if (header != null && header.startsWith("Bearer ")) {
-            String token = header.substring(7);
-            if (jwt.isValid(token)) {
-                String username = jwt.getUsername(token);
-                String role     = jwt.getRole(token);
-                users.findByUsername(username).ifPresent(user -> {
-                    var auth = new UsernamePasswordAuthenticationToken(
-                        user, null,
-                        List.of(new SimpleGrantedAuthority("ROLE_" + role)));
-                    SecurityContextHolder.getContext().setAuthentication(auth);
-                });
+        try {
+            String header = req.getHeader("Authorization");
+            if (header != null && header.startsWith("Bearer ")) {
+                String token = header.substring(7);
+                if (jwt.isValid(token)) {
+                    String username = jwt.getUsername(token);
+                    String role     = jwt.getRole(token);
+                    String tenantId = jwt.getTenantId(token);
+                    String requestedTenant = req.getHeader("X-Tenant-Id");
+                    users.findByUsername(username).ifPresent(user -> {
+                        var auth = new UsernamePasswordAuthenticationToken(
+                            user, null,
+                            List.of(new SimpleGrantedAuthority("ROLE_" + role)));
+                        SecurityContextHolder.getContext().setAuthentication(auth);
+                        String resolvedTenant = tenantId != null ? tenantId : user.tenantId;
+                        if ("ADMIN".equalsIgnoreCase(role)
+                            && requestedTenant != null
+                            && !requestedTenant.isBlank()) {
+                            resolvedTenant = requestedTenant;
+                        }
+                        TenantContext.set(resolvedTenant);
+                    });
+                }
             }
+            chain.doFilter(req, res);
+        } finally {
+            TenantContext.clear();
         }
-        chain.doFilter(req, res);
     }
 }
