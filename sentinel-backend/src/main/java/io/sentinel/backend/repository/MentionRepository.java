@@ -10,6 +10,8 @@ public interface MentionRepository extends JpaRepository<MentionEntity, String>,
     List<MentionEntity> findByTenantIdOrderByPostedAtDesc(String tenantId);
     List<MentionEntity> findByTenantIdAndReplyStatusOrderByPostedAtDesc(String tenantId, String status);
     List<MentionEntity> findByTenantIdAndPostedAtAfterOrderByPostedAtDesc(String tenantId, Instant since);
+    List<MentionEntity> findByTenantIdAndHandleAndPostedAtAfterOrderByPostedAtDesc(
+        String tenantId, String handle, Instant since);
     List<MentionEntity> findByTenantIdAndPriorityAndProcessingStatusNot(
         String tenantId, String priority, String status);
 

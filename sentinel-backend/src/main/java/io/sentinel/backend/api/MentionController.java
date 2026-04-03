@@ -1,13 +1,20 @@
 package io.sentinel.backend.api;
 import io.sentinel.backend.config.TenantContext;
+import io.sentinel.backend.agents.TicketAgent;
+import io.sentinel.backend.connector.ChannelConnectorFactory;
 import io.sentinel.backend.connector.TicketConnectorFactory;
+import io.sentinel.backend.repository.ChannelReplyPostEntity;
+import io.sentinel.backend.repository.ChannelReplyPostRepository;
 import io.sentinel.backend.ingestion.MockMentionIngestionService;
 import io.sentinel.backend.repository.MentionEntity;
 import io.sentinel.backend.repository.MentionRepository;
+import io.sentinel.backend.repository.PredictionHistoryRepository;
 import io.sentinel.backend.repository.SavedSearchEntity;
 import io.sentinel.backend.repository.SavedSearchRepository;
 import io.sentinel.backend.security.UserEntity;
 import io.sentinel.backend.service.AnalyticsService;
+import io.sentinel.backend.service.CompetitiveAnalyticsService;
+import io.sentinel.backend.service.MentionProcessingService;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.beans.factory.annotation.Value;
@@ -28,7 +35,12 @@ public class MentionController {
 
     private final MentionRepository       repo;
     private final SavedSearchRepository   savedSearchRepo;
+    private final PredictionHistoryRepository predictionRepo;
+    private final MentionProcessingService mentionProcessingService;
     private final AnalyticsService        analytics;
+    private final CompetitiveAnalyticsService competitiveAnalytics;
+    private final ChannelReplyPostRepository channelReplyPostRepo;
+    private final ChannelConnectorFactory channelFactory;
     private final TicketConnectorFactory  ticketFactory;
     private final MockMentionIngestionService ingestion;
 
@@ -40,13 +52,25 @@ public class MentionController {
 
     @Value("${sentinel.brand.tone:professional,empathetic,solution-focused}")
     private String brandTone;
+    @Value("${sentinel.prediction.alert-threshold:70}")
+    private double predictionAlertThreshold;
 
     public MentionController(MentionRepository repo, SavedSearchRepository savedSearchRepo,
+        PredictionHistoryRepository predictionRepo,
+        MentionProcessingService mentionProcessingService,
         AnalyticsService analytics,
+        CompetitiveAnalyticsService competitiveAnalytics,
+        ChannelReplyPostRepository channelReplyPostRepo,
+        ChannelConnectorFactory channelFactory,
         TicketConnectorFactory ticketFactory, MockMentionIngestionService ingestion) {
         this.repo = repo;
         this.savedSearchRepo = savedSearchRepo;
+        this.predictionRepo = predictionRepo;
+        this.mentionProcessingService = mentionProcessingService;
         this.analytics = analytics;
+        this.competitiveAnalytics = competitiveAnalytics;
+        this.channelReplyPostRepo = channelReplyPostRepo;
+        this.channelFactory = channelFactory;
         this.ticketFactory = ticketFactory; this.ingestion = ingestion;
     }
 
@@ -205,6 +229,21 @@ public class MentionController {
         return analytics.getBrandHealth(TenantContext.getOrDefault());
     }
 
+    @GetMapping("/analytics/competitive/sentiment")
+    public List<Map<String, Object>> getCompetitiveSentiment(
+        @RequestParam(defaultValue = "24") int hours) {
+        String tenantId = TenantContext.getOrDefault();
+        return competitiveAnalytics.getSentimentComparison(tenantId, handle, hours);
+    }
+
+    @GetMapping("/analytics/competitive/volume-trend")
+    public List<Map<String, Object>> getCompetitiveVolumeTrend(
+        @RequestParam(defaultValue = "24") int hours,
+        @RequestParam(defaultValue = "2") int bucketHours) {
+        String tenantId = TenantContext.getOrDefault();
+        return competitiveAnalytics.getVolumeTrendComparison(tenantId, handle, hours, bucketHours);
+    }
+
     @GetMapping("/tickets")
     public List<Map<String,Object>> getTickets() {
         String tenantId = TenantContext.getOrDefault();
@@ -238,6 +277,51 @@ public class MentionController {
         });
         return ok ? ResponseEntity.ok(Map.of("status","resolved"))
                   : ResponseEntity.ok(Map.of("status","updated locally"));
+    }
+
+    @PostMapping("/mentions/{id}/escalate")
+    public ResponseEntity<?> escalateMention(@PathVariable String id,
+        @RequestBody(required = false) Map<String, String> body) {
+        String tenantId = TenantContext.getOrDefault();
+        return repo.findById(id).filter(m -> tenantId.equals(m.tenantId)).map(m -> {
+            m.priority = "P1";
+            m.urgency = "CRITICAL";
+            m.assignedTeam = (body != null && body.containsKey("team") && !body.get("team").isBlank())
+                ? body.get("team")
+                : (m.assignedTeam != null && !m.assignedTeam.isBlank() ? m.assignedTeam : "CRISIS_RESPONSE");
+
+            if (m.ticketId == null || m.ticketId.isBlank()) {
+                TicketAgent.TicketPayload payload = new TicketAgent.TicketPayload();
+                payload.title = (m.summary != null && !m.summary.isBlank())
+                    ? m.summary
+                    : m.text.substring(0, Math.min(80, m.text.length()));
+                payload.description = m.text;
+                payload.priority = "P1";
+                payload.category = (m.topic != null && !m.topic.isBlank()) ? m.topic : "GENERAL";
+                try {
+                    String ticketId = ticketFactory.get().createTicket(m, payload);
+                    m.ticketId = ticketId;
+                    m.ticketStatus = "OPEN";
+                    m.ticketSystem = ticketFactory.get().getName();
+                } catch (Exception e) {
+                    return ResponseEntity.ok(Map.of(
+                        "escalated", true,
+                        "ticketCreated", false,
+                        "error", e.getMessage()
+                    ));
+                }
+            }
+
+            m.updatedAt = Instant.now();
+            repo.save(m);
+            return ResponseEntity.ok(Map.of(
+                "escalated", true,
+                "mentionId", m.id,
+                "priority", m.priority,
+                "ticketId", m.ticketId,
+                "ticketStatus", m.ticketStatus
+            ));
+        }).orElse(ResponseEntity.notFound().build());
     }
 
     @GetMapping("/pending-replies")
@@ -321,6 +405,126 @@ public class MentionController {
         return savedSearchRepo.findByIdAndTenantIdAndUserId(id, tenantId, userId).map(s -> {
             savedSearchRepo.delete(s);
             return ResponseEntity.ok(Map.of("deleted", true));
+        }).orElse(ResponseEntity.notFound().build());
+    }
+
+    @GetMapping("/predictions")
+    public List<Map<String, Object>> getPredictions(@RequestParam(defaultValue = "24") int hours,
+        @RequestParam(defaultValue = "100") int limit) {
+        String tenantId = TenantContext.getOrDefault();
+        Instant since = Instant.now().minus(Math.max(1, hours), ChronoUnit.HOURS);
+        return predictionRepo.findByTenantIdAndPredictedAtAfterOrderByPredictedAtDesc(tenantId, since).stream()
+            .limit(Math.max(1, Math.min(500, limit)))
+            .map(p -> {
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("id", p.id);
+                m.put("mentionId", p.mentionId);
+                m.put("tenantId", p.tenantId);
+                m.put("viralityScore6h", p.viralityScore6h);
+                m.put("viralityScore24h", p.viralityScore24h);
+                m.put("escalationLevel", p.escalationLevel);
+                m.put("recommendedAction", p.recommendedAction);
+                m.put("predictedAt", p.predictedAt != null ? p.predictedAt.toEpochMilli() : 0L);
+                return m;
+            })
+            .toList();
+    }
+
+    @GetMapping("/predictions/alerts")
+    public List<Map<String, Object>> getPredictionAlerts(@RequestParam(defaultValue = "24") int hours,
+        @RequestParam(defaultValue = "100") int limit) {
+        String tenantId = TenantContext.getOrDefault();
+        Instant since = Instant.now().minus(Math.max(1, hours), ChronoUnit.HOURS);
+        return predictionRepo.findByTenantIdAndPredictedAtAfterOrderByPredictedAtDesc(tenantId, since).stream()
+            .filter(p -> p.viralityScore24h >= predictionAlertThreshold)
+            .limit(Math.max(1, Math.min(500, limit)))
+            .map(p -> {
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("id", p.id);
+                m.put("mentionId", p.mentionId);
+                m.put("tenantId", p.tenantId);
+                m.put("viralityScore24h", p.viralityScore24h);
+                m.put("escalationLevel", p.escalationLevel);
+                m.put("recommendedAction", p.recommendedAction);
+                m.put("alertThreshold", predictionAlertThreshold);
+                m.put("triggered", true);
+                m.put("predictedAt", p.predictedAt != null ? p.predictedAt.toEpochMilli() : 0L);
+                return m;
+            })
+            .toList();
+    }
+
+    @GetMapping("/predictions/policy/evaluate")
+    public Map<String, Object> evaluatePredictionPolicy(
+        @RequestParam double score24h,
+        @RequestParam(defaultValue = "P3") String currentPriority) {
+        return mentionProcessingService.evaluatePredictionPolicy(score24h, currentPriority);
+    }
+
+    @PostMapping("/replies/{mentionId}/post")
+    public ResponseEntity<?> postReplyToChannels(@PathVariable String mentionId,
+        @RequestBody(required = false) Map<String, Object> body) {
+        String tenantId = TenantContext.getOrDefault();
+
+        return repo.findById(mentionId).filter(m -> tenantId.equals(m.tenantId)).map(m -> {
+            if (m.replyText == null || m.replyText.isBlank()) {
+                return ResponseEntity.badRequest().body(Map.of("error", "No reply text to post"));
+            }
+            if (!"APPROVED".equalsIgnoreCase(m.replyStatus)) {
+                return ResponseEntity.badRequest().body(Map.of("error", "Reply must be APPROVED before posting"));
+            }
+
+            List<String> channels = new ArrayList<>();
+            if (body != null && body.containsKey("channels") && body.get("channels") instanceof List<?> list) {
+                for (Object it : list) {
+                    if (it != null && !String.valueOf(it).isBlank()) channels.add(String.valueOf(it));
+                }
+            }
+            if (channels.isEmpty()) channels = List.of("MOCK");
+
+            List<Map<String, Object>> results = new ArrayList<>();
+            boolean anyPosted = false;
+            for (String channel : channels) {
+                ChannelReplyPostEntity row = new ChannelReplyPostEntity();
+                row.mentionId = m.id;
+                row.tenantId = tenantId;
+                row.channel = channel;
+                try {
+                    var connector = channelFactory.get(channel);
+                    if (!connector.isEnabled()) {
+                        row.status = "SKIPPED";
+                        row.errorMessage = "Connector disabled";
+                    } else {
+                        String externalId = connector.postReply(m, m.replyText);
+                        row.status = "POSTED";
+                        row.externalPostId = externalId;
+                        anyPosted = true;
+                    }
+                } catch (Exception ex) {
+                    row.status = "FAILED";
+                    row.errorMessage = ex.getMessage();
+                }
+                channelReplyPostRepo.save(row);
+
+                Map<String, Object> r = new LinkedHashMap<>();
+                r.put("channel", channel);
+                r.put("status", row.status);
+                r.put("externalPostId", row.externalPostId);
+                r.put("error", row.errorMessage);
+                results.add(r);
+            }
+
+            if (anyPosted) {
+                m.replyStatus = "POSTED";
+                m.updatedAt = Instant.now();
+                repo.save(m);
+            }
+
+            return ResponseEntity.ok(Map.of(
+                "mentionId", m.id,
+                "posted", anyPosted,
+                "results", results
+            ));
         }).orElse(ResponseEntity.notFound().build());
     }
 

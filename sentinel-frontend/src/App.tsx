@@ -15,7 +15,9 @@ import { useMentions, useLiveEvents, useAnalytics, useTrend,
   useTickets, usePendingReplies, useAlerts,
   approveReply, rejectReply, resolveTicket, ingestMention, useConfig, useTenants,
   useSavedSearches, createSavedSearch, deleteSavedSearch, searchMentions,
-  useReliabilityMetrics } from "./hooks/useSentinel";
+  useReliabilityMetrics, useCompetitiveSentiment, useCompetitiveVolumeTrend,
+  postReplyToChannels, usePredictionAlerts, escalateMention,
+  useAdminUsers, adminCreateUser, adminCreateUsersBulk } from "./hooks/useSentinel";
 import { timeAgo, fmtFollowers } from "./utils/timeAgo";
 import type { Mention } from "./types";
 
@@ -78,8 +80,9 @@ function BrandHealthGauge({ score }:{ score:number }) {
 }
 
 // ── Improved MentionCard with inline editor + copy button ─────────
-function MentionCard({ m, onDone, isNew, focused }:
-  { m:Mention; onDone?:()=>void; isNew?:boolean; focused?:boolean }) {
+function MentionCard({ m, onDone, isNew, focused, canReviewActions = false, canPostToChannels = false }:
+  { m:Mention; onDone?:()=>void; isNew?:boolean; focused?:boolean;
+    canReviewActions?:boolean; canPostToChannels?:boolean }) {
   const [exp, setExp] = useState(focused || false);
   const [editReply, setEditReply] = useState(false);
   const sc = m.sentimentLabel==="POSITIVE"?C.green:m.sentimentLabel==="NEGATIVE"?C.red:
@@ -96,7 +99,7 @@ function MentionCard({ m, onDone, isNew, focused }:
     transition:"border-color .2s", animation:isNew?"slideIn .4s ease":"none",
     boxShadow:focused?"0 0 0 2px #3b82f622":isNew?"0 0 14px rgba(59,130,246,.12)":"none",
     outline:"none"
-  }} tabIndex={0} onClick={()=>setExp(!exp)}>
+  }} data-mention-id={m.id} tabIndex={0} onClick={()=>setExp(!exp)}>
     {/* Row 1: author + badges */}
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
       <div style={{flex:1,minWidth:0}}>
@@ -159,7 +162,7 @@ function MentionCard({ m, onDone, isNew, focused }:
                 <CopyButton text={m.replyText} label="Copy"/>
               </div>
               <div style={{color:"var(--text)",fontSize:12,lineHeight:1.5,marginBottom:8}}>{m.replyText}</div>
-              {m.replyStatus==="PENDING"&&<div style={{display:"flex",gap:6}}>
+              {m.replyStatus==="PENDING"&&canReviewActions&&<div style={{display:"flex",gap:6}}>
                 <button onClick={()=>setEditReply(true)} style={{
                   background:"#3b82f622",color:C.blue,border:"1px solid #3b82f644",
                   borderRadius:6,padding:"4px 12px",cursor:"pointer",fontSize:11,fontFamily:"Inter",fontWeight:600}}>
@@ -174,6 +177,17 @@ function MentionCard({ m, onDone, isNew, focused }:
                   background:C.red+"22",color:C.red,border:"1px solid "+C.red+"44",
                   borderRadius:6,padding:"4px 12px",cursor:"pointer",fontSize:11,fontFamily:"Inter"}}>
                   ✗ Reject
+                </button>
+              </div>}
+              {m.replyStatus==="APPROVED"&&canPostToChannels&&<div style={{display:"flex",gap:6}}>
+                <button onClick={async(e)=>{
+                  e.stopPropagation();
+                  await postReplyToChannels(m.id, ["MOCK"]);
+                  onDone?.();
+                }} style={{
+                  background:C.blue+"22",color:C.blue,border:"1px solid "+C.blue+"44",
+                  borderRadius:6,padding:"4px 12px",cursor:"pointer",fontSize:11,fontFamily:"Inter"}}>
+                  📣 Post to Channel
                 </button>
               </div>}
             </div>
@@ -211,9 +225,10 @@ const TABS = [
   {id:"test",label:"Test",icon:"🧪"},
 ];
 
-function Sidebar({ tab, setTab, collapsed, setCollapsed, pendingCount, alertCount }:
+function Sidebar({ tab, setTab, collapsed, setCollapsed, pendingCount, alertCount, tabs }:
   { tab:string; setTab:(t:string)=>void; collapsed:boolean;
-    setCollapsed:(v:boolean)=>void; pendingCount:number; alertCount:number }) {
+    setCollapsed:(v:boolean)=>void; pendingCount:number; alertCount:number;
+    tabs:{id:string;label:string;icon:string}[] }) {
   const { isDark, toggle } = useTheme();
   return <div className={"sidebar"+(collapsed?" collapsed":"")}>
     <div style={{padding:"14px 14px 10px",borderBottom:"1px solid var(--border)",
@@ -225,7 +240,7 @@ function Sidebar({ tab, setTab, collapsed, setCollapsed, pendingCount, alertCoun
       </div>}
     </div>
     <nav style={{flex:1,paddingTop:8,overflow:"hidden"}}>
-      {TABS.map(t=>{
+      {tabs.map(t=>{
         const badge = t.id==="replies"?pendingCount:t.id==="alerts"?alertCount:0;
         return <div key={t.id} className={"nav-item"+(tab===t.id?" active":"")}
           onClick={()=>setTab(t.id)} title={collapsed?t.label:undefined}
@@ -276,6 +291,9 @@ export default function App() {
   const [searchResults, setSearchResults] = useState<Mention[] | null>(null);
   const [searchBusy, setSearchBusy] = useState(false);
   const [savedName, setSavedName] = useState("");
+  const [jumpToMentionId, setJumpToMentionId] = useState<string | null>(null);
+  const [escalatingPredictionIds, setEscalatingPredictionIds] = useState<Record<string, boolean>>({});
+  const [escalatedPredictionTickets, setEscalatedPredictionTickets] = useState<Record<string, string | null>>({});
   const { toasts, add: addToast, remove: removeToast } = useToast();
 
   const { data: analytics }   = useAnalytics(24);
@@ -285,10 +303,43 @@ export default function App() {
   const { data: tickets, refetch: refetchTickets } = useTickets();
   const { data: pending, refetch: refetchPending }  = usePendingReplies();
   const alerts                = useAlerts();
+  const predictionAlerts      = usePredictionAlerts(24);
   const { data: config } = useConfig();
   const { data: tenants } = useTenants(isAdmin);
   const { data: savedSearches, refetch: refetchSavedSearches } = useSavedSearches();
   const { data: reliability } = useReliabilityMetrics(isAdmin);
+  const { data: adminUsers, loading: adminUsersLoading, refetch: refetchAdminUsers } = useAdminUsers(isAdmin);
+  const competitiveSentiment = useCompetitiveSentiment(24);
+  const competitiveTrend = useCompetitiveVolumeTrend(24, 2);
+  const [selectedCompetitor, setSelectedCompetitor] = useState("");
+  const [newUser, setNewUser] = useState({
+    username: "", email: "", password: "", fullName: "", role: "REVIEWER", tenantId: activeTenantId || "default"
+  });
+  const [bulkCsv, setBulkCsv] = useState("username,email,password,fullName,role,tenantId\n");
+  const [creatingUser, setCreatingUser] = useState(false);
+  const [creatingBulkUsers, setCreatingBulkUsers] = useState(false);
+  const canReviewActions = ["REVIEWER", "ANALYST", "ADMIN"].includes(user.role);
+  const canAnalyze = ["ANALYST", "ADMIN"].includes(user.role);
+  const visibleTabs = TABS.filter(t => {
+    if (t.id === "replies") return canReviewActions;
+    if (t.id === "tickets") return canAnalyze;
+    if (t.id === "test") return canAnalyze;
+    return true;
+  });
+
+  useEffect(() => {
+    const allowed = TABS.some(t => t.id === tab && (t.id !== "replies" || canReviewActions) &&
+      (t.id !== "tickets" || canAnalyze) && (t.id !== "test" || canAnalyze));
+    if (!allowed) setTab("overview");
+  }, [tab, canReviewActions, canAnalyze]);
+
+  useEffect(() => {
+    const firstCompetitor = (competitiveTrend || []).find((r:any) => !r?.isPrimary)?.handle || "";
+    if (!selectedCompetitor && firstCompetitor) setSelectedCompetitor(firstCompetitor);
+    if (selectedCompetitor && !(competitiveTrend || []).some((r:any) => r?.handle === selectedCompetitor)) {
+      setSelectedCompetitor(firstCompetitor);
+    }
+  }, [competitiveTrend, selectedCompetitor]);
 
   // Merge live + historical
   const prevIds = useRef<Set<string>>(new Set());
@@ -316,7 +367,8 @@ export default function App() {
   const sourceMentions = searchResults ?? merged;
   const filteredMentions = sourceMentions.filter(m=>{
     const ms=!search||(m.text||"").toLowerCase().includes(search.toLowerCase())||
-      (m.authorUsername||"").toLowerCase().includes(search.toLowerCase());
+      (m.authorUsername||"").toLowerCase().includes(search.toLowerCase())||
+      (m.id||"").toLowerCase().includes(search.toLowerCase());
     const mf=filter==="ALL"||
       (["POSITIVE","NEGATIVE","NEUTRAL"].includes(filter)&&m.sentimentLabel===filter)||
       (filter==="PENDING"&&m.replyStatus==="PENDING")||
@@ -327,6 +379,22 @@ export default function App() {
   const newIds = new Set(liveEvents.filter(e=>e.type==="mention.new").map(e=>e.data.id));
   const { visible, hasMore, sentinelRef, reset: resetScroll } = useInfiniteScroll(filteredMentions, 15);
   useEffect(()=>{ resetScroll(); setFocusIdx(0); }, [search, filter, tab]);
+
+  useEffect(() => {
+    if (tab !== "feed" || !jumpToMentionId) return;
+    const idx = filteredMentions.findIndex(m => m.id === jumpToMentionId);
+    if (idx < 0) return;
+    setFocusIdx(idx);
+    requestAnimationFrame(() => {
+      const cards = document.querySelectorAll<HTMLElement>("[data-mention-id]");
+      const target = Array.from(cards).find(el => el.dataset.mentionId === jumpToMentionId);
+      if (target) {
+        target.focus();
+        target.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    });
+    setJumpToMentionId(null);
+  }, [tab, jumpToMentionId, filteredMentions]);
 
   // Keyboard shortcuts
   useKeyboard([
@@ -340,21 +408,101 @@ export default function App() {
     { key:"j", action:()=>setFocusIdx(i=>Math.min(i+1,filteredMentions.length-1)) },
     { key:"k", action:()=>setFocusIdx(i=>Math.max(i-1,0)) },
     { key:"a", action:async()=>{ const m=filteredMentions[focusIdx];
-      if(m?.replyStatus==="PENDING"){ await approveReply(m.id); refetchPending(); refetchMentions();
+      if(canReviewActions && m?.replyStatus==="PENDING"){ await approveReply(m.id); refetchPending(); refetchMentions();
         addToast({type:"success",title:"Approved",message:"Reply approved via keyboard"}); }}},
     { key:"r", action:async()=>{ const m=filteredMentions[focusIdx];
-      if(m?.replyStatus==="PENDING"){ await rejectReply(m.id); refetchPending(); refetchMentions();
+      if(canReviewActions && m?.replyStatus==="PENDING"){ await rejectReply(m.id); refetchPending(); refetchMentions();
         addToast({type:"warning",title:"Rejected",message:"Reply rejected via keyboard"}); }}},
     { key:"Escape", action:()=>{ setSearch(""); setFilter("ALL"); } },
   ]);
 
   const doTest = async() => {
+    if (!canAnalyze) {
+      addToast({ type:"warning", title:"No access", message:"Your role cannot ingest test mentions" });
+      return;
+    }
     if(!testText.trim()) return;
     setSubmitting(true);
     await ingestMention(testText, testAuthor, parseInt(testFoll)||500, testPlatform);
     setTestText(""); setSubmitting(false);
     addToast({type:"info",title:"Submitted",message:"AI pipeline is analysing your mention..."});
     setTimeout(refetchMentions, 5000);
+  };
+
+  useEffect(() => {
+    setNewUser(prev => ({ ...prev, tenantId: prev.tenantId || activeTenantId || "default" }));
+  }, [activeTenantId]);
+
+  const createSingleAdminUser = async () => {
+    if (!newUser.username.trim() || !newUser.email.trim() || newUser.password.trim().length < 8) {
+      addToast({ type:"warning", title:"Missing fields", message:"username, email and password (min 8 chars) are required" });
+      return;
+    }
+    setCreatingUser(true);
+    try {
+      const r = await adminCreateUser({
+        username: newUser.username.trim(),
+        email: newUser.email.trim(),
+        password: newUser.password,
+        fullName: newUser.fullName.trim() || newUser.username.trim(),
+        role: newUser.role as any,
+        tenantId: (newUser.tenantId || activeTenantId || "default").trim(),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        addToast({ type:"error", title:"Create failed", message:String((body as any)?.error || "Unable to create user") });
+        return;
+      }
+      addToast({ type:"success", title:"User created", message:`${newUser.username} (${newUser.role}) created` });
+      setNewUser(prev => ({ ...prev, username:"", email:"", password:"", fullName:"" }));
+      refetchAdminUsers();
+    } finally {
+      setCreatingUser(false);
+    }
+  };
+
+  const createBulkAdminUsers = async () => {
+    const lines = bulkCsv.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    if (!lines.length) {
+      addToast({ type:"warning", title:"CSV empty", message:"Paste at least one user row" });
+      return;
+    }
+    const maybeHeader = lines[0].toLowerCase().startsWith("username,");
+    const rows = (maybeHeader ? lines.slice(1) : lines)
+      .map(line => line.split(",").map(x => x.trim()))
+      .filter(cols => cols.length >= 3)
+      .map(cols => ({
+        username: cols[0],
+        email: cols[1],
+        password: cols[2],
+        fullName: cols[3] || cols[0],
+        role: (cols[4] || "REVIEWER").toUpperCase(),
+        tenantId: cols[5] || activeTenantId || "default",
+      }))
+      .filter(u => u.username && u.email && u.password);
+
+    if (!rows.length) {
+      addToast({ type:"warning", title:"No valid rows", message:"Use csv: username,email,password,fullName,role,tenantId" });
+      return;
+    }
+
+    setCreatingBulkUsers(true);
+    try {
+      const r = await adminCreateUsersBulk(rows as any);
+      const body = await r.json().catch(() => ({} as any));
+      if (!r.ok) {
+        addToast({ type:"error", title:"Bulk create failed", message:String(body?.error || "Unable to create users") });
+        return;
+      }
+      addToast({
+        type:"success",
+        title:"Bulk user create complete",
+        message:`Created ${body?.createdCount ?? 0}, skipped ${body?.skippedCount ?? 0}`,
+      });
+      refetchAdminUsers();
+    } finally {
+      setCreatingBulkUsers(false);
+    }
   };
 
   const health = analytics?.brandHealthScore ?? 0;
@@ -457,7 +605,7 @@ export default function App() {
 
   return <div className="app-layout">
     <Sidebar tab={tab} setTab={setTab} collapsed={collapsed} setCollapsed={setCollapsed}
-      pendingCount={pending.length} alertCount={alerts.length}/>
+      pendingCount={pending.length} alertCount={alerts.length} tabs={visibleTabs}/>
 
     <div className="main-area">
       {/* Header */}
@@ -465,7 +613,7 @@ export default function App() {
         padding:"0 20px",height:50,display:"flex",alignItems:"center",
         justifyContent:"space-between",flexShrink:0}}>
         <div style={{color:"var(--text2)",fontSize:12,fontWeight:500}}>
-          {TABS.find(t=>t.id===tab)?.icon}&nbsp;{TABS.find(t=>t.id===tab)?.label}
+          {visibleTabs.find(t=>t.id===tab)?.icon || "🏠"}&nbsp;{visibleTabs.find(t=>t.id===tab)?.label || "Overview"}
         </div>
         <div style={{display:"flex",alignItems:"center",gap:8}}>
           <Dot/><span style={{color:C.green,fontSize:11}}>LIVE</span>
@@ -584,7 +732,8 @@ export default function App() {
                      <div style={{fontSize:28,marginBottom:8}}>{String(color)===C.red?"✅":"⏳"}</div>
                      No {String(title).split(" ")[1].toLowerCase()} mentions</div>:
                    (list as Mention[]).slice(0,5).map((m,i)=><MentionCard key={m.id} m={m}
-                     isNew={newIds.has(m.id)} focused={focusIdx===i} onDone={onDone}/>)}
+                     isNew={newIds.has(m.id)} focused={focusIdx===i} onDone={onDone}
+                     canReviewActions={canReviewActions} canPostToChannels={canAnalyze}/>)}
                 </div>
               </div>
             ))}
@@ -641,7 +790,8 @@ export default function App() {
              visible.length===0?<div style={{padding:40,textAlign:"center",color:"var(--dim)"}}>
                <div style={{fontSize:32,marginBottom:12}}>🔍</div>No mentions match filter</div>:
              visible.map((m,i)=><MentionCard key={m.id} m={m} isNew={newIds.has(m.id)}
-               focused={focusIdx===i} onDone={onDone}/>)}
+               focused={focusIdx===i} onDone={onDone}
+               canReviewActions={canReviewActions} canPostToChannels={canAnalyze}/>)}
             {hasMore&&<div ref={sentinelRef} style={{padding:12,textAlign:"center",color:"var(--dim)",fontSize:11}}>↓ Loading more...</div>}
           </div>
         </div>}
@@ -706,6 +856,75 @@ export default function App() {
               </div>
             </div>
           </div>
+
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginTop:12}}>
+            <div style={{background:"var(--card-bg)",border:"1px solid var(--border)",borderRadius:10,overflow:"hidden"}}>
+              <div style={{padding:"11px 16px",borderBottom:"1px solid var(--border)",color:"var(--text)",fontWeight:600,fontSize:11}}>
+                🏁 Competitive Sentiment (24h)
+              </div>
+              <div style={{padding:10,maxHeight:220,overflowY:"auto"}}>
+                {competitiveSentiment.length===0
+                  ? <div style={{padding:18,color:"var(--dim)",fontSize:11}}>No competitor data configured yet.</div>
+                  : <table style={{width:"100%",borderCollapse:"collapse"}}>
+                      <thead>
+                        <tr>
+                          { ["Handle","Total","Pos%","Neg%"].map(h => (
+                            <th key={h} style={{textAlign:"left",fontSize:9,color:"var(--muted)",padding:"6px 8px",borderBottom:"1px solid var(--border)",textTransform:"uppercase",letterSpacing:"1"}}>{h}</th>
+                          )) }
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {competitiveSentiment.map((r:any, i:number)=><tr key={i} style={{borderBottom:"1px solid var(--border)"}}>
+                          <td style={{padding:"7px 8px",fontSize:11,color:r.isPrimary?C.blue:"var(--text)"}}>{r.handle}{r.isPrimary?" (You)":""}</td>
+                          <td style={{padding:"7px 8px",fontSize:11,color:"var(--text2)"}}>{r.totalMentions}</td>
+                          <td style={{padding:"7px 8px",fontSize:11,color:C.green}}>{r.positivePct}%</td>
+                          <td style={{padding:"7px 8px",fontSize:11,color:C.red}}>{r.negativePct}%</td>
+                        </tr>)}
+                      </tbody>
+                    </table>}
+              </div>
+            </div>
+
+            <div style={{background:"var(--card-bg)",border:"1px solid var(--border)",borderRadius:10,overflow:"hidden"}}>
+              <div style={{padding:"11px 16px",borderBottom:"1px solid var(--border)",display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+                <span style={{color:"var(--text)",fontWeight:600,fontSize:11}}>📉 Competitive Volume Trend</span>
+                <select
+                  value={selectedCompetitor}
+                  onChange={e=>setSelectedCompetitor(e.target.value)}
+                  style={{background:"var(--bg)",border:"1px solid var(--border)",color:"var(--text)",padding:"4px 8px",borderRadius:6,fontSize:10,minWidth:140}}>
+                  {(competitiveTrend || []).filter((r:any)=>!r?.isPrimary).map((r:any)=><option key={r.handle} value={r.handle}>{r.handle}</option>)}
+                </select>
+              </div>
+              <div style={{height:220,paddingTop:8}}>
+                <ResponsiveContainer>
+                  {(() => {
+                    const primaryRow = (competitiveTrend || []).find((r:any)=>r?.isPrimary) || competitiveTrend?.[0];
+                    const competitorRow = (competitiveTrend || []).find((r:any)=>r?.handle===selectedCompetitor)
+                      || (competitiveTrend || []).find((r:any)=>!r?.isPrimary)
+                      || competitiveTrend?.[1];
+                    const chartData = (primaryRow?.points || []).map((p:any)=>({
+                      bucket: `${p.bucketStartHoursAgo}-${p.bucketEndHoursAgo}h`,
+                      primary: p.count,
+                      competitor: (competitorRow?.points || []).find((x:any)=>x.bucketStartHoursAgo===p.bucketStartHoursAgo)?.count || 0,
+                    }));
+                    return (
+                  <BarChart
+                    data={chartData}
+                    margin={{top:8,right:12,bottom:8,left:0}}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border)"/>
+                    <XAxis dataKey="bucket" tick={{fill:"var(--muted)",fontSize:9}}/>
+                    <YAxis tick={{fill:"var(--muted)",fontSize:9}} allowDecimals={false}/>
+                    <Tooltip content={<TT/>}/>
+                    <Legend iconType="circle" iconSize={8} wrapperStyle={{fontSize:10}}/>
+                    <Bar dataKey="primary" name={primaryRow?.handle || "Primary"} fill={C.blue} radius={[3,3,0,0]}/>
+                    <Bar dataKey="competitor" name={competitorRow?.handle || "Competitor"} fill={C.orange} radius={[3,3,0,0]}/>
+                  </BarChart>
+                    );
+                  })()}
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
         </div>}
 
         {tab==="tickets"&&<div>
@@ -751,7 +970,7 @@ export default function App() {
                     <td style={{padding:"9px 14px",fontSize:10,color:"var(--dim)"}}>{new Date(t.createdAt).toLocaleTimeString()}</td>
                     <td style={{padding:"9px 14px"}}>
                       <div style={{display:"flex",gap:4}}>
-                        {t.status==="OPEN"&&<button onClick={async()=>{
+                        {canAnalyze&&t.status==="OPEN"&&<button onClick={async()=>{
                           await resolveTicket(t.id,"Resolved via dashboard");
                           refetchTickets();
                           addToast({type:"success",title:"Resolved",message:t.id+" marked resolved"});}}
@@ -783,7 +1002,8 @@ export default function App() {
           <div style={{padding:12,maxHeight:"calc(100vh - 280px)",overflowY:"auto"}}>
             {pending.length===0?<div style={{padding:40,textAlign:"center",color:"var(--dim)"}}>
               <div style={{fontSize:32,marginBottom:12}}>✅</div><div>Queue empty</div></div>:
-             pending.map((m,i)=><MentionCard key={m.id} m={m} focused={focusIdx===i} onDone={onDone}/>)}
+             pending.map((m,i)=><MentionCard key={m.id} m={m} focused={focusIdx===i} onDone={onDone}
+               canReviewActions={canReviewActions} canPostToChannels={canAnalyze}/>)}
           </div>
         </div>}
 
@@ -795,6 +1015,84 @@ export default function App() {
               borderRadius:20,padding:"2px 9px",fontSize:9,fontWeight:700}}>{alerts.length}</span>
           </div>
           <div style={{padding:12}}>
+            <div style={{background:"var(--bg)",border:"1px solid var(--border)",borderRadius:8,padding:10,marginBottom:10}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <span style={{color:"var(--text)",fontSize:11,fontWeight:600}}>🔮 Predicted Crisis Alerts (24h)</span>
+                <span style={{background:C.purple+"1a",color:C.purple,border:"1px solid "+C.purple+"33",
+                  borderRadius:20,padding:"2px 9px",fontSize:9,fontWeight:700}}>{predictionAlerts.length}</span>
+              </div>
+              {predictionAlerts.length===0
+                ? <div style={{color:"var(--dim)",fontSize:10}}>No predicted crisis alerts right now.</div>
+                : <div style={{display:"grid",gap:6}}>
+                    {predictionAlerts.slice(0,5).map((p:any)=>{
+                      const mentionId = String(p.mentionId || "");
+                      const mentionMeta = merged.find(m => m.id === mentionId);
+                      const isAlreadyP1 = mentionMeta?.priority === "P1";
+                      const hasEscalatedInUi = Object.prototype.hasOwnProperty.call(escalatedPredictionTickets, mentionId);
+                      const isEscalating = !!escalatingPredictionIds[mentionId];
+                      const disablePromote = !canAnalyze || !mentionId || isAlreadyP1 || hasEscalatedInUi || isEscalating;
+                      const showEscalated = isAlreadyP1 || hasEscalatedInUi;
+                      const ticketId = escalatedPredictionTickets[mentionId] || mentionMeta?.ticketId || null;
+
+                      return <div key={p.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 8px",border:"1px solid var(--border)",borderRadius:6,gap:8}}>
+                      <div style={{fontSize:11,color:"var(--text2)",flex:1,minWidth:0,display:"flex",alignItems:"center",gap:6,flexWrap:"wrap" as const}}>
+                        <button
+                          onClick={()=>{
+                            setTab("feed");
+                            setSearch(mentionId);
+                            setFilter("ALL");
+                            setJumpToMentionId(mentionId || null);
+                          }}
+                          style={{
+                            background:"none",
+                            border:"none",
+                            padding:0,
+                            margin:0,
+                            color:C.blue,
+                            cursor:"pointer",
+                            fontSize:11,
+                            fontFamily:"JetBrains Mono"
+                          }}
+                          title={`Open ${mentionId} in feed`}>
+                          {mentionId}
+                        </button>
+                        {" · "}<span style={{color:C.red}}>{p.escalationLevel}</span>
+                        {ticketId && <span style={{color:C.orange,fontFamily:"JetBrains Mono",fontSize:10}}>· {ticketId}</span>}
+                      </div>
+                      <div style={{fontSize:10,color:C.orange,fontFamily:"JetBrains Mono"}}>{p.viralityScore24h}</div>
+                      <button
+                        onClick={async()=>{
+                          if (!mentionId || disablePromote) return;
+                          setEscalatingPredictionIds(prev => ({ ...prev, [mentionId]: true }));
+                          try {
+                            const r = await escalateMention(mentionId, "CRISIS_RESPONSE");
+                            if (r.ok) {
+                              const body = await r.json().catch(() => ({} as any));
+                              const nextTicketId = body?.ticketId ? String(body.ticketId) : null;
+                              setEscalatedPredictionTickets(prev => ({ ...prev, [mentionId]: nextTicketId }));
+                              addToast({ type:"success", title:"Escalated", message:`${mentionId} escalated to P1` });
+                              refetchMentions();
+                              refetchTickets();
+                            } else {
+                              addToast({ type:"error", title:"Escalation failed", message:`${mentionId} could not be escalated` });
+                            }
+                          } finally {
+                            setEscalatingPredictionIds(prev => ({ ...prev, [mentionId]: false }));
+                          }
+                        }}
+                        disabled={disablePromote}
+                        style={{
+                          background:(disablePromote ? "var(--border)" : C.red+"22"),
+                          color:(disablePromote ? "var(--dim)" : C.red),
+                          border:"1px solid "+(disablePromote ? "var(--border)" : C.red+"44"),
+                          borderRadius:6,padding:"3px 8px",cursor:disablePromote?"not-allowed":"pointer",fontSize:10,fontFamily:"Inter"
+                        }}>
+                        {isEscalating ? "Escalating..." : !canAnalyze ? "No Access" : showEscalated ? "Escalated ✓" : "Promote P1"}
+                      </button>
+                    </div>})}
+                  </div>}
+            </div>
+
             {alerts.map(m=><div key={m.id} style={{background:"var(--bg)",border:"1px solid #ef444444",
               borderLeft:"3px solid "+C.red,borderRadius:8,padding:12,marginBottom:8,animation:"slideIn .3s ease"}}>
               <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:6}}>
@@ -874,6 +1172,71 @@ export default function App() {
               </div>
             </div>
           </div>
+
+          {isAdmin&&<div style={{marginTop:12,background:"var(--card-bg)",border:"1px solid var(--border)",borderRadius:10,overflow:"hidden"}}>
+            <div style={{padding:"11px 16px",borderBottom:"1px solid var(--border)",color:"var(--text)",fontWeight:600,fontSize:11}}>
+              👥 Admin Users (Single + Bulk CSV)
+            </div>
+            <div style={{padding:14,display:"grid",gap:12}}>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                <input value={newUser.username} onChange={e=>setNewUser(v=>({...v,username:e.target.value}))}
+                  placeholder="username"
+                  style={{background:"var(--bg)",border:"1px solid var(--border)",color:"var(--text)",padding:"8px 10px",borderRadius:8,fontSize:12}}/>
+                <input value={newUser.email} onChange={e=>setNewUser(v=>({...v,email:e.target.value}))}
+                  placeholder="email"
+                  style={{background:"var(--bg)",border:"1px solid var(--border)",color:"var(--text)",padding:"8px 10px",borderRadius:8,fontSize:12}}/>
+                <input value={newUser.password} onChange={e=>setNewUser(v=>({...v,password:e.target.value}))}
+                  placeholder="password (min 8 chars)"
+                  style={{background:"var(--bg)",border:"1px solid var(--border)",color:"var(--text)",padding:"8px 10px",borderRadius:8,fontSize:12}}/>
+                <input value={newUser.fullName} onChange={e=>setNewUser(v=>({...v,fullName:e.target.value}))}
+                  placeholder="full name"
+                  style={{background:"var(--bg)",border:"1px solid var(--border)",color:"var(--text)",padding:"8px 10px",borderRadius:8,fontSize:12}}/>
+                <select value={newUser.role} onChange={e=>setNewUser(v=>({...v,role:e.target.value}))}
+                  style={{background:"var(--bg)",border:"1px solid var(--border)",color:"var(--text)",padding:"8px 10px",borderRadius:8,fontSize:12}}>
+                  <option value="READ_ONLY">READ_ONLY</option>
+                  <option value="REVIEWER">REVIEWER</option>
+                  <option value="ANALYST">ANALYST</option>
+                  <option value="ADMIN">ADMIN</option>
+                </select>
+                <input value={newUser.tenantId} onChange={e=>setNewUser(v=>({...v,tenantId:e.target.value}))}
+                  placeholder="tenantId"
+                  style={{background:"var(--bg)",border:"1px solid var(--border)",color:"var(--text)",padding:"8px 10px",borderRadius:8,fontSize:12}}/>
+              </div>
+              <button onClick={createSingleAdminUser} disabled={creatingUser}
+                style={{background:creatingUser?"var(--border)":C.blue+"22",color:creatingUser?"var(--dim)":C.blue,border:"1px solid "+(creatingUser?"var(--border)":C.blue+"44"),borderRadius:8,padding:"8px 10px",fontSize:11,cursor:creatingUser?"not-allowed":"pointer"}}>
+                {creatingUser?"Creating...":"Create User"}
+              </button>
+
+              <div style={{borderTop:"1px solid var(--border)",paddingTop:10}}>
+                <div style={{color:"var(--muted)",fontSize:10,marginBottom:6}}>Paste CSV rows: username,email,password,fullName,role,tenantId</div>
+                <textarea value={bulkCsv} onChange={e=>setBulkCsv(e.target.value)}
+                  style={{width:"100%",minHeight:96,background:"var(--bg)",border:"1px solid var(--border)",color:"var(--text)",padding:"8px 10px",borderRadius:8,fontSize:11,fontFamily:"JetBrains Mono",outline:"none"}}/>
+                <button onClick={createBulkAdminUsers} disabled={creatingBulkUsers}
+                  style={{marginTop:8,background:creatingBulkUsers?"var(--border)":C.purple+"22",color:creatingBulkUsers?"var(--dim)":C.purple,border:"1px solid "+(creatingBulkUsers?"var(--border)":C.purple+"44"),borderRadius:8,padding:"7px 10px",fontSize:11,cursor:creatingBulkUsers?"not-allowed":"pointer"}}>
+                  {creatingBulkUsers?"Creating...":"Create Users from CSV"}
+                </button>
+              </div>
+
+              <div style={{borderTop:"1px solid var(--border)",paddingTop:10}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                  <span style={{color:"var(--muted)",fontSize:10}}>Existing users ({adminUsers.length})</span>
+                  <button onClick={refetchAdminUsers} style={{background:"none",border:"1px solid var(--border)",color:"var(--muted)",fontSize:10,padding:"3px 8px",borderRadius:6,cursor:"pointer"}}>Refresh</button>
+                </div>
+                <div style={{maxHeight:180,overflowY:"auto",border:"1px solid var(--border)",borderRadius:8}}>
+                  {adminUsersLoading
+                    ? <div style={{padding:10,color:"var(--dim)",fontSize:10}}>Loading users...</div>
+                    : adminUsers.length===0
+                      ? <div style={{padding:10,color:"var(--dim)",fontSize:10}}>No users found</div>
+                      : adminUsers.slice(0,30).map(u=><div key={u.id} style={{display:"grid",gridTemplateColumns:"1.2fr 1.4fr .8fr .8fr",gap:8,padding:"7px 10px",borderBottom:"1px solid var(--border)",fontSize:10}}>
+                          <span style={{color:"var(--text)",fontFamily:"JetBrains Mono"}}>{u.username}</span>
+                          <span style={{color:"var(--text2)"}}>{u.email}</span>
+                          <span style={{color:C.blue}}>{u.role}</span>
+                          <span style={{color:u.active?C.green:C.red}}>{u.active?"ACTIVE":"DISABLED"}</span>
+                        </div>)}
+                </div>
+              </div>
+            </div>
+          </div>}
         </div>}
 
       </div>

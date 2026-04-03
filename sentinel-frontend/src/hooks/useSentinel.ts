@@ -111,6 +111,46 @@ export function useTrend(hours = 24) {
   return data;
 }
 
+export function useCompetitiveSentiment(hours = 24) {
+  const [data, setData] = useState<any[]>([]);
+  const fetch_ = useCallback(async () => {
+    try {
+      const r = await authFetch(`${API}/api/analytics/competitive/sentiment?hours=${hours}`);
+      setData(await r.json());
+    } catch (e) {
+      console.error(e);
+      setData([]);
+    }
+  }, [hours]);
+  useEffect(() => {
+    fetch_();
+    const t = setInterval(fetch_, 30000);
+    return () => clearInterval(t);
+  }, [fetch_]);
+  return data;
+}
+
+export function useCompetitiveVolumeTrend(hours = 24, bucketHours = 2) {
+  const [data, setData] = useState<any[]>([]);
+  const fetch_ = useCallback(async () => {
+    try {
+      const r = await authFetch(
+        `${API}/api/analytics/competitive/volume-trend?hours=${hours}&bucketHours=${bucketHours}`
+      );
+      setData(await r.json());
+    } catch (e) {
+      console.error(e);
+      setData([]);
+    }
+  }, [hours, bucketHours]);
+  useEffect(() => {
+    fetch_();
+    const t = setInterval(fetch_, 30000);
+    return () => clearInterval(t);
+  }, [fetch_]);
+  return data;
+}
+
 export function useTickets() {
   const [data, setData]       = useState<Ticket[]>([]);
   const [loading, setLoading] = useState(true);
@@ -161,6 +201,26 @@ export function useAlerts() {
   return data;
 }
 
+export function usePredictionAlerts(hours = 24) {
+  const [data, setData] = useState<any[]>([]);
+  const fetch_ = useCallback(async () => {
+    try {
+      const r = await authFetch(`${API}/api/predictions/alerts?hours=${hours}`);
+      if (r.ok) setData(await r.json());
+      else setData([]);
+    } catch (e) {
+      console.error(e);
+      setData([]);
+    }
+  }, [hours]);
+  useEffect(() => {
+    fetch_();
+    const t = setInterval(fetch_, 15000);
+    return () => clearInterval(t);
+  }, [fetch_]);
+  return data;
+}
+
 // ── Config hook ────────────────────────────────────────────────────
 export function useConfig() {
   const [data, setData] = useState<{handle: string; brandName: string; brandTone: string} | null>(null);
@@ -202,6 +262,39 @@ export function useTenants(enabled = true) {
   useEffect(() => {
     fetch_();
   }, [fetch_]);
+  return { data, loading, refetch: fetch_ };
+}
+
+export type AdminUser = {
+  id: string;
+  username: string;
+  email: string;
+  role: "ADMIN" | "ANALYST" | "REVIEWER" | "READ_ONLY";
+  active: boolean;
+  tenantId: string;
+};
+
+export function useAdminUsers(enabled = false) {
+  const [data, setData] = useState<AdminUser[]>([]);
+  const [loading, setLoading] = useState(enabled);
+  const fetch_ = useCallback(async () => {
+    if (!enabled) {
+      setData([]);
+      setLoading(false);
+      return;
+    }
+    try {
+      const r = await authFetch(`${API}/api/admin/users`);
+      if (r.ok) setData(await r.json());
+      else setData([]);
+    } catch (e) {
+      console.error(e);
+      setData([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [enabled]);
+  useEffect(() => { fetch_(); }, [fetch_]);
   return { data, loading, refetch: fetch_ };
 }
 
@@ -305,6 +398,38 @@ export async function deleteSavedSearch(id: string) {
   return authFetch(`${API}/api/saved-searches/${id}`, { method: "DELETE" });
 }
 
+export async function adminCreateUser(payload: {
+  username: string;
+  email: string;
+  password: string;
+  fullName?: string;
+  role?: "ADMIN" | "ANALYST" | "REVIEWER" | "READ_ONLY";
+  tenantId?: string;
+  active?: boolean;
+}) {
+  return authFetch(`${API}/api/admin/users`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function adminCreateUsersBulk(users: Array<{
+  username: string;
+  email: string;
+  password: string;
+  fullName?: string;
+  role?: "ADMIN" | "ANALYST" | "REVIEWER" | "READ_ONLY";
+  tenantId?: string;
+  active?: boolean;
+}>) {
+  return authFetch(`${API}/api/admin/users/bulk`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ users }),
+  });
+}
+
 // ── Action helpers ────────────────────────────────────────────────
 export async function approveReply(id: string) {
   return authFetch(`${API}/api/mentions/${id}/reply/approve`, { method: "POST" });
@@ -323,6 +448,23 @@ export async function resolveTicket(id: string, resolution: string) {
     body: JSON.stringify({ resolution }),
   });
 }
+
+export async function postReplyToChannels(id: string, channels: string[] = ["MOCK"]) {
+  return authFetch(`${API}/api/replies/${id}/post`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ channels }),
+  });
+}
+
+export async function escalateMention(id: string, team = "CRISIS_RESPONSE") {
+  return authFetch(`${API}/api/mentions/${id}/escalate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ team }),
+  });
+}
+
 export async function ingestMention(text: string, author: string, followers: number, platform = "TWITTER") {
   return authFetch(`${API}/api/mentions/ingest`, {
     method: "POST",

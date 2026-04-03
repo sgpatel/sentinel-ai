@@ -45,6 +45,7 @@ public class MentionProcessingService {
     private final SquadContext           ctx;
     private final MentionRepository      repo;
     private final MentionDlqRepository   dlqRepo;
+    private final PredictionService      predictionService;
     private final TicketConnectorFactory connectorFactory;
     private final MentionWebSocketHandler ws;
     @Value("${sentinel.retry.max-attempts:3}")
@@ -55,17 +56,23 @@ public class MentionProcessingService {
     private int circuitFailureThreshold;
     @Value("${sentinel.circuit-breaker.open-ms:30000}")
     private long circuitOpenMs;
+    @Value("${sentinel.prediction.alert-threshold:70}")
+    private double predictionAlertThreshold;
+    @Value("${sentinel.prediction.priority-bump-threshold:85}")
+    private double predictionPriorityBumpThreshold;
     private final Map<String, CircuitState> circuits = new ConcurrentHashMap<>();
     private final Map<String, OperationStats> opStats = new ConcurrentHashMap<>();
 
     public MentionProcessingService(SquadContext ctx,
                                     MentionRepository repo,
                                     MentionDlqRepository dlqRepo,
+                                    PredictionService predictionService,
                                     TicketConnectorFactory connectorFactory,
                                     MentionWebSocketHandler ws) {
         this.ctx              = ctx;
         this.repo             = repo;
         this.dlqRepo          = dlqRepo;
+        this.predictionService = predictionService;
         this.connectorFactory = connectorFactory;
         this.ws               = ws;
     }
@@ -153,6 +160,60 @@ public class MentionProcessingService {
         } else {
             mention.priority     = normalizePriority(mention.sentimentLabel);
             mention.assignedTeam = "TECH_SUPPORT";
+        }
+
+        // ── Step 2b: Viral prediction + proactive alerting ───────
+        boolean predictionCandidate = "NEGATIVE".equalsIgnoreCase(mention.sentimentLabel)
+            || "P1".equalsIgnoreCase(mention.priority)
+            || "HIGH".equalsIgnoreCase(mention.urgency)
+            || "CRITICAL".equalsIgnoreCase(mention.urgency);
+        if (predictionCandidate) {
+            try {
+                Map<String, Object> prediction = predictionService.predictAndStore(mention);
+                double score6h = ((Number) prediction.getOrDefault("viralityScore6h", 0.0)).doubleValue();
+                double score24h = ((Number) prediction.getOrDefault("viralityScore24h", 0.0)).doubleValue();
+                String oldPriority = mention.priority;
+                Map<String, Object> policy = evaluatePredictionPolicy(score24h, mention.priority);
+                boolean alertTriggered = Boolean.TRUE.equals(policy.get("alertTriggered"));
+                boolean priorityBumped = Boolean.TRUE.equals(policy.get("priorityBumped"));
+                String newPriority = String.valueOf(policy.get("newPriority"));
+
+                mention.viralRiskScore = Math.max(mention.viralRiskScore, (int) Math.round(score24h));
+                mention.isViral = mention.isViral || alertTriggered;
+                mention.priority = newPriority;
+
+                if (priorityBumped) {
+                    mention.assignedTeam = nvl(mention.assignedTeam, "CRISIS_RESPONSE");
+                }
+                if (alertTriggered) {
+                    Map<String, Object> payload = new LinkedHashMap<>();
+                    payload.put("contractVersion", "1.0");
+                    payload.put("eventType", "alert.predicted_crisis");
+                    payload.put("triggeredAtEpochMs", Instant.now().toEpochMilli());
+                    payload.put("mentionId", mention.id);
+                    payload.put("tenantId", nvl(mention.tenantId, "default"));
+                    payload.put("triggerReason", "virality_score_24h");
+                    payload.put("thresholds", Map.of(
+                        "alertThreshold", predictionAlertThreshold,
+                        "priorityBumpThreshold", predictionPriorityBumpThreshold
+                    ));
+                    payload.put("scores", Map.of(
+                        "viralityScore6h", score6h,
+                        "viralityScore24h", score24h
+                    ));
+                    payload.put("policy", Map.of(
+                        "alertTriggered", alertTriggered,
+                        "priorityBumped", priorityBumped,
+                        "oldPriority", oldPriority,
+                        "newPriority", newPriority
+                    ));
+                    payload.put("escalationLevel", prediction.get("escalationLevel"));
+                    payload.put("recommendedAction", prediction.get("recommendedAction"));
+                    ws.broadcast("alert.predicted_crisis", payload);
+                }
+            } catch (Exception e) {
+                System.err.println("[MentionService] Prediction failed for " + mention.id + ": " + e.getMessage());
+            }
         }
 
         // ── Step 3: Reply generation ──────────────────────────────
@@ -372,6 +433,25 @@ public class MentionProcessingService {
         out.put("retryBaseDelayMs", retryBaseDelayMs);
         out.put("circuitFailureThreshold", circuitFailureThreshold);
         out.put("circuitOpenMs", circuitOpenMs);
+        out.put("predictionAlertThreshold", predictionAlertThreshold);
+        out.put("predictionPriorityBumpThreshold", predictionPriorityBumpThreshold);
+        return out;
+    }
+
+    public Map<String, Object> evaluatePredictionPolicy(double score24h, String currentPriority) {
+        String normalizedPriority = normalizePriority(currentPriority);
+        boolean alertTriggered = score24h >= predictionAlertThreshold;
+        boolean priorityBumped = score24h >= predictionPriorityBumpThreshold;
+        String newPriority = priorityBumped ? "P1" : normalizedPriority;
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("score24h", score24h);
+        out.put("alertThreshold", predictionAlertThreshold);
+        out.put("priorityBumpThreshold", predictionPriorityBumpThreshold);
+        out.put("alertTriggered", alertTriggered);
+        out.put("priorityBumped", priorityBumped);
+        out.put("oldPriority", normalizedPriority);
+        out.put("newPriority", newPriority);
         return out;
     }
 

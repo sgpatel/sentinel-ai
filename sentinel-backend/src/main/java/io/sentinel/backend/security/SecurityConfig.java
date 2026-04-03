@@ -60,12 +60,18 @@ public class SecurityConfig {
                 .requestMatchers("/ws/**", "/h2-console/**", "/actuator/health").permitAll()
                 // Analytics — any authenticated user
                 .requestMatchers(HttpMethod.GET, "/api/analytics/**", "/api/mentions", "/api/alerts").authenticated()
+                // Mention detail + prediction views — any authenticated user
+                .requestMatchers(HttpMethod.GET, "/api/mentions/*", "/api/predictions/**").authenticated()
                 // Reply approvals — REVIEWER+
                 .requestMatchers("/api/mentions/*/reply/**").hasAnyRole("REVIEWER","ANALYST","ADMIN")
+                // Reply publishing — REVIEWER+
+                .requestMatchers(HttpMethod.POST, "/api/replies/**").hasAnyRole("REVIEWER","ANALYST","ADMIN")
                 // Ticket management — ANALYST+
                 .requestMatchers("/api/tickets/**").hasAnyRole("ANALYST","ADMIN")
                 // Ingest — ANALYST+
                 .requestMatchers(HttpMethod.POST, "/api/mentions/ingest").hasAnyRole("ANALYST","ADMIN")
+                // Escalation action — ANALYST+
+                .requestMatchers(HttpMethod.POST, "/api/mentions/*/escalate").hasAnyRole("ANALYST","ADMIN")
                 // Admin only
                 .requestMatchers("/api/admin/**").hasRole("ADMIN")
                 .anyRequest().authenticated()
