@@ -46,6 +46,7 @@ public class MentionProcessingService {
     private final MentionRepository      repo;
     private final MentionDlqRepository   dlqRepo;
     private final PredictionService      predictionService;
+    private final KnowledgeBaseService   knowledgeBaseService;
     private final TicketConnectorFactory connectorFactory;
     private final MentionWebSocketHandler ws;
     @Value("${sentinel.retry.max-attempts:3}")
@@ -67,12 +68,14 @@ public class MentionProcessingService {
                                     MentionRepository repo,
                                     MentionDlqRepository dlqRepo,
                                     PredictionService predictionService,
+                                    KnowledgeBaseService knowledgeBaseService,
                                     TicketConnectorFactory connectorFactory,
                                     MentionWebSocketHandler ws) {
         this.ctx              = ctx;
         this.repo             = repo;
         this.dlqRepo          = dlqRepo;
         this.predictionService = predictionService;
+        this.knowledgeBaseService = knowledgeBaseService;
         this.connectorFactory = connectorFactory;
         this.ws               = ws;
     }
@@ -225,11 +228,28 @@ public class MentionProcessingService {
             "Priority: "  + nvl(mention.priority)       + "\n" +
             "Topic: "     + nvl(mention.topic);
 
+        List<Map<String, Object>> kbContext = knowledgeBaseService.retrieveForReply(
+            nvl(mention.topic) + " " + nvl(mention.text), 2);
+        if (!kbContext.isEmpty()) {
+            StringBuilder kbBlock = new StringBuilder("\nUse these knowledge snippets if relevant:\n");
+            for (Map<String, Object> snippet : kbContext) {
+                kbBlock.append("- ")
+                    .append(snippet.getOrDefault("title", "Untitled"))
+                    .append(": ")
+                    .append(snippet.getOrDefault("snippet", ""))
+                    .append(" [")
+                    .append(snippet.getOrDefault("citation", ""))
+                    .append("]\n");
+            }
+            replyPrompt += kbBlock;
+        }
+        final String promptForReplyAgent = replyPrompt;
+
         ReplyAgent.GeneratedReply reply = null;
         try {
             reply = withRetry("ReplyAgent", () ->
                 (ReplyAgent.GeneratedReply) ctx.submitTo(
-                    AgentRole.SUPPORT, replyPrompt, ReplyAgent.GeneratedReply.class));
+                    AgentRole.SUPPORT, promptForReplyAgent, ReplyAgent.GeneratedReply.class));
         } catch (Exception e) {
             System.err.println("[MentionService] Reply generation failed for "
                 + mention.id + ": " + e.getMessage());
@@ -241,6 +261,18 @@ public class MentionProcessingService {
             mention.replyText = "Thank you for reaching out to "
                 + nvl(mention.handle, "@us")
                 + ". Our team is reviewing this and will respond shortly.";
+        }
+
+        if (!kbContext.isEmpty()) {
+            String citations = kbContext.stream()
+                .map(s -> String.valueOf(s.getOrDefault("citation", "")))
+                .filter(c -> !c.isBlank())
+                .distinct()
+                .reduce((a, b) -> a + ", " + b)
+                .orElse("");
+            if (!citations.isBlank()) {
+                mention.replyText = mention.replyText + "\n\nSources: " + citations;
+            }
         }
         mention.replyStatus = "PENDING";
 

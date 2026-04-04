@@ -8,6 +8,7 @@ import { MentionSkeleton } from "./components/Skeleton";
 import { CopyButton } from "./components/CopyButton";
 import { InlineReplyEditor } from "./components/InlineReplyEditor";
 import { KeyboardHelp } from "./components/KeyboardHelp";
+import { WorkflowStudio } from "./components/WorkflowStudio";
 import { useTheme } from "./theme/ThemeContext";
 import { useKeyboard } from "./hooks/useKeyboard";
 import { useInfiniteScroll } from "./hooks/useInfiniteScroll";
@@ -100,7 +101,6 @@ function MentionCard({ m, onDone, isNew, focused, canReviewActions = false, canP
     boxShadow:focused?"0 0 0 2px #3b82f622":isNew?"0 0 14px rgba(59,130,246,.12)":"none",
     outline:"none"
   }} data-mention-id={m.id} tabIndex={0} onClick={()=>setExp(!exp)}>
-    {/* Row 1: author + badges */}
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
       <div style={{flex:1,minWidth:0}}>
         <div style={{display:"flex",alignItems:"center",gap:5,marginBottom:4,flexWrap:"wrap" as const}}>
@@ -122,10 +122,8 @@ function MentionCard({ m, onDone, isNew, focused, canReviewActions = false, canP
       </div>
     </div>
 
-    {/* Expanded section */}
     {exp&&<div style={{marginTop:10,borderTop:"1px solid var(--border)",paddingTop:10}}
       onClick={e=>e.stopPropagation()}>
-      {/* Meta grid */}
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:8}}>
         {[["Topic",m.topic],["Team",m.assignedTeam],["Priority",m.priority],
           ["Emotion",m.primaryEmotion],["Ticket",m.ticketId],["Status",m.processingStatus]]
@@ -136,7 +134,6 @@ function MentionCard({ m, onDone, isNew, focused, canReviewActions = false, canP
           </div>)}
       </div>
 
-      {/* Action row */}
       <div style={{display:"flex",gap:6,marginBottom:m.replyText?8:0,flexWrap:"wrap" as const}}>
         {m.url&&<a href={m.url} target="_blank" rel="noreferrer"
           style={{background:"none",color:"var(--muted)",border:"1px solid var(--border)",
@@ -147,7 +144,6 @@ function MentionCard({ m, onDone, isNew, focused, canReviewActions = false, canP
         {m.url&&<CopyButton text={m.url} label="Copy URL"/>}
       </div>
 
-      {/* Reply section */}
       {m.replyText&&(
         editReply
           ? <InlineReplyEditor mentionId={m.id} originalReply={m.replyText}
@@ -222,6 +218,7 @@ const TABS = [
   {id:"tickets",label:"Tickets",icon:"🎫"},
   {id:"replies",label:"Reply Queue",icon:"💬"},
   {id:"alerts",label:"Alerts",icon:"🚨"},
+  {id:"workflow",label:"Workflow",icon:"⚙️"},
   {id:"test",label:"Test",icon:"🧪"},
 ];
 
@@ -323,13 +320,15 @@ export default function App() {
   const visibleTabs = TABS.filter(t => {
     if (t.id === "replies") return canReviewActions;
     if (t.id === "tickets") return canAnalyze;
+    if (t.id === "workflow") return canAnalyze;
     if (t.id === "test") return canAnalyze;
     return true;
   });
 
   useEffect(() => {
     const allowed = TABS.some(t => t.id === tab && (t.id !== "replies" || canReviewActions) &&
-      (t.id !== "tickets" || canAnalyze) && (t.id !== "test" || canAnalyze));
+      (t.id !== "tickets" || canAnalyze) && (t.id !== "workflow" || canAnalyze) &&
+      (t.id !== "test" || canAnalyze));
     if (!allowed) setTab("overview");
   }, [tab, canReviewActions, canAnalyze]);
 
@@ -404,7 +403,8 @@ export default function App() {
     { key:"4", action:()=>setTab("tickets")   },
     { key:"5", action:()=>setTab("replies")   },
     { key:"6", action:()=>setTab("alerts")    },
-    { key:"7", action:()=>setTab("test")      },
+    { key:"7", action:()=>setTab("workflow")  },
+    { key:"8", action:()=>setTab("test")      },
     { key:"j", action:()=>setFocusIdx(i=>Math.min(i+1,filteredMentions.length-1)) },
     { key:"k", action:()=>setFocusIdx(i=>Math.max(i-1,0)) },
     { key:"a", action:async()=>{ const m=filteredMentions[focusIdx];
@@ -1118,6 +1118,8 @@ export default function App() {
           </div>
         </div>}
 
+        {tab==="workflow"&&<WorkflowStudio mentions={merged} canAnalyze={canAnalyze} isAdmin={isAdmin} addToast={addToast}/>}
+
         {tab==="test"&&<div style={{maxWidth:660}}>
           <div style={{background:"var(--card-bg)",border:"1px solid var(--border)",borderRadius:10,overflow:"hidden"}}>
             <div style={{padding:"11px 16px",borderBottom:"1px solid var(--border)",color:"var(--text)",fontWeight:600,fontSize:11}}>🧪 Test Mention Injection</div>
@@ -1245,7 +1247,7 @@ export default function App() {
       <div style={{padding:"6px 20px",borderTop:"1px solid var(--border)",background:"var(--bg)",
         display:"flex",justifyContent:"space-between",color:"var(--dim)",fontSize:10,flexShrink:0}}>
         <span>SentinelAI v1.0.0 · SquadOS v3.4.0</span>
-        <span>⌨ Press ? for shortcuts · 1-7 switch tabs · J/K navigate · A approve · R reject</span>
+        <span>⌨ Press ? for shortcuts · 1-8 switch tabs · J/K navigate · A approve · R reject</span>
         <span>Mentions: {merged.length} · Pending: {pending.length} · Tickets: {tickets.length}</span>
       </div>
     </div>

@@ -6,7 +6,12 @@ const API = import.meta.env.VITE_API_URL || "http://localhost:8090";
 const WS  = import.meta.env.VITE_WS_URL  || "ws://localhost:8090/ws/mentions";
 
 // ── Authenticated fetch helper ────────────────────────────────────
-async function authFetch(url: string, options: RequestInit = {}) {
+async function authFetch(
+  url: string,
+  options: RequestInit = {},
+  authOptions: { logoutOn401?: boolean } = {}
+) {
+  const { logoutOn401 = true } = authOptions;
   const res = await fetch(url, {
     ...options,
     headers: {
@@ -14,7 +19,7 @@ async function authFetch(url: string, options: RequestInit = {}) {
       ...(options.headers || {}),
     },
   });
-  if (res.status === 401) {
+  if (res.status === 401 && logoutOn401) {
     // Token expired — clear local storage and reload to show login page
     localStorage.removeItem("sentinel_auth");
     window.location.reload();
@@ -471,4 +476,68 @@ export async function ingestMention(text: string, author: string, followers: num
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text, author, followers, platform }),
   });
+}
+
+export async function listWorkflowRules() {
+  const r = await authFetch(`${API}/api/workflows/rules`);
+  return r.ok ? r.json() : [];
+}
+
+export async function createWorkflowRule(payload: {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  priority?: number;
+  conflictStrategy?: string;
+  conditions: Array<{ field: string; operator: string; value: string; position?: number }>;
+  actions: Array<{ type: string; payload?: Record<string, any>; position?: number }>;
+}) {
+  return authFetch(`${API}/api/workflows/rules`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function setWorkflowRuleEnabled(id: string, enabled: boolean) {
+  return authFetch(`${API}/api/workflows/rules/${id}/enable?enabled=${enabled}`, {
+    method: "PUT",
+  });
+}
+
+export async function deleteWorkflowRule(id: string) {
+  return authFetch(`${API}/api/workflows/rules/${id}`, {
+    method: "DELETE",
+  }, { logoutOn401: false });
+}
+
+export async function dryRunWorkflow(mentionId: string) {
+  return authFetch(`${API}/api/workflows/evaluate/dry-run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mentionId }),
+  });
+}
+
+export async function executeWorkflow(mentionId: string) {
+  return authFetch(`${API}/api/workflows/execute`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mentionId }),
+  });
+}
+
+export async function listWorkflowExecutions(limit = 20) {
+  const r = await authFetch(`${API}/api/workflows/executions?limit=${limit}`);
+  return r.ok ? r.json() : [];
+}
+
+export async function listWorkflowExecutionSteps(executionId: string) {
+  const r = await authFetch(`${API}/api/workflows/executions/${executionId}/steps`);
+  return r.ok ? r.json() : [];
+}
+
+export async function listKbArticles() {
+  const r = await authFetch(`${API}/api/admin/kb/articles`);
+  return r.ok ? r.json() : [];
 }

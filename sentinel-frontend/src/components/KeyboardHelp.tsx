@@ -1,7 +1,7 @@
 import { useState } from "react";
 
 const SHORTCUTS = [
-  { keys: ["1-7"],   desc: "Switch to tab 1-7" },
+  { keys: ["1-8"],   desc: "Switch to tab 1-8" },
   { keys: ["A"],        desc: "Approve focused reply" },
   { keys: ["R"],        desc: "Reject focused reply" },
   { keys: ["J"],        desc: "Next mention" },
